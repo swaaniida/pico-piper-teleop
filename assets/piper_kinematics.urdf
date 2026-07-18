@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<!-- Kinematics-only PiPER model derived from manipulation_pipeline-main.
+     Visual/collision meshes are intentionally omitted. -->
+<robot name="piper_kinematics">
+  <link name="base_link"/>
+  <link name="link1"/>
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/><child link="link1"/>
+    <origin xyz="0 0 0.123" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-2.618" upper="2.168" effort="100" velocity="5"/>
+  </joint>
+  <link name="link2"/>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/><child link="link2"/>
+    <origin xyz="0 0 0" rpy="1.5708 -0.10095 -3.1416"/><axis xyz="0 0 1"/>
+    <limit lower="0" upper="3.14" effort="100" velocity="5"/>
+  </joint>
+  <link name="link3"/>
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/><child link="link3"/>
+    <origin xyz="0.28503 0 0" rpy="0 0 -1.759"/><axis xyz="0 0 1"/>
+    <limit lower="-2.967" upper="0" effort="100" velocity="5"/>
+  </joint>
+  <link name="link4"/>
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/><child link="link4"/>
+    <origin xyz="-0.021984 -0.25075 0" rpy="1.5708 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-1.745" upper="1.745" effort="100" velocity="5"/>
+  </joint>
+  <link name="link5"/>
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/><child link="link5"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-1.22" upper="1.22" effort="100" velocity="5"/>
+  </joint>
+  <link name="link6"/>
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/><child link="link6"/>
+    <origin xyz="0.000088259 -0.091 0" rpy="1.5708 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-2.0944" upper="2.0944" effort="100" velocity="3"/>
+  </joint>
+</robot>

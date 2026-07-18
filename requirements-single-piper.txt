@@ -1,0 +1,5 @@
+# Installed into the existing Python 3.10 piper-xr environment.
+numpy
+scipy
+placo==0.9.23
+pyrealsense2==2.58.2.10647

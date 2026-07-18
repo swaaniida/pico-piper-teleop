@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# Hardware recordings and generated episode data
+data/episodes/
+recordings/
+logs/
+
+# Local hardware bring-up history retained outside the compact GitHub app
+scripts/
+config/
