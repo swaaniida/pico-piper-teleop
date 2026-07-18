@@ -13,3 +13,5 @@ logs/
 # Local hardware bring-up history retained outside the compact GitHub app
 scripts/
 config/
+AGENTS.md
+docs/
