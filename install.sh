@@ -14,4 +14,4 @@ python -m pip install -e src/XRoboToolkit-PC-Service-Pybind
 python -m pip install -e .
 
 python -m single_piper_teleop.preflight --software-only
-echo "Installation complete. Run the hardware preflight after connecting PiPER and RealSense."
+echo "Installation complete. Source ROS 2 and the Tracer workspace before integrated teleoperation."

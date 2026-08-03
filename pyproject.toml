@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "single-piper-teleop"
-version = "0.1.0"
-description = "Compact PICO teleoperation and synchronized RGB-D capture for one AgileX PiPER"
+name = "pico-piper-tracer-teleop"
+version = "0.2.0"
+description = "Synchronized PICO teleoperation and RGB-D capture for PiPER and Tracer Mini"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
@@ -19,6 +19,7 @@ piper-teleop = "single_piper_teleop.teleop:main"
 piper-validate = "single_piper_teleop.validate:main"
 piper-recover = "single_piper_teleop.recover:main"
 piper-preflight = "single_piper_teleop.preflight:main"
+tracer-teleop = "tracer_mini.pico_teleop:main"
 
 [tool.setuptools]
-packages = ["single_piper_teleop"]
+packages = ["single_piper_teleop", "tracer_mini"]

@@ -1,0 +1,16 @@
+diff --git a/tracer_base/include/tracer_base/tracer_messenger.hpp b/tracer_base/include/tracer_base/tracer_messenger.hpp
+index 94937cd..d537e3f 100644
+--- a/tracer_base/include/tracer_base/tracer_messenger.hpp
++++ b/tracer_base/include/tracer_base/tracer_messenger.hpp
+@@ -89,2 +89,2 @@ class TracerMessenger {
+-    //status_msg.vehicle_state = state.system_state.vehicle_state;
++    status_msg.vehicle_state = state.system_state.vehicle_state;
+     status_msg.control_mode = state.system_state.control_mode;
+diff --git a/tracer_msgs/msg/TracerStatus.msg b/tracer_msgs/msg/TracerStatus.msg
+index 865c407..f4c233f 100644
+--- a/tracer_msgs/msg/TracerStatus.msg
++++ b/tracer_msgs/msg/TracerStatus.msg
+@@ -16,2 +16,2 @@ float64 angular_velocity
+-#uint8 vehicle_state
++uint8 vehicle_state
+ uint8 control_mode

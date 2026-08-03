@@ -11,7 +11,7 @@ import argparse
 from piper_sdk import C_PiperInterface_V2
 
 
-CAN_NAME = "can0"
+CAN_NAME = "piper_can"
 MAX_WAYPOINT_DELTA = 5_000
 WAYPOINT_TOLERANCE = 400
 FINAL_TOLERANCE = 400
@@ -69,7 +69,7 @@ def main() -> None:
     args = parser.parse_args()
     target_final = tuple(int(round(value * 1000.0)) for value in args.target)
     if not os.path.exists(f"/sys/class/net/{CAN_NAME}"):
-        raise RuntimeError("can0 is absent")
+        raise RuntimeError(f"{CAN_NAME} is absent")
 
     piper = C_PiperInterface_V2(
         can_name=CAN_NAME,
@@ -79,7 +79,7 @@ def main() -> None:
         start_sdk_joint_limit=False,
         start_sdk_gripper_limit=False,
     )
-    piper.ConnectPort()
+    piper.ConnectPort(piper_init=False)
     try:
         time.sleep(1.0)
         feedback = piper.GetArmJointMsgs()

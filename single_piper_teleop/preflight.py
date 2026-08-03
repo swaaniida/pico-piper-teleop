@@ -8,6 +8,7 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PIPER_CAN = "piper_can"
 
 
 def check_import(name: str) -> None:
@@ -37,16 +38,16 @@ def main() -> None:
     if args.software_only:
         return
 
-    can = Path("/sys/class/net/can0")
+    can = Path(f"/sys/class/net/{PIPER_CAN}")
     if not can.exists():
-        raise RuntimeError("can0 is absent")
+        raise RuntimeError(f"{PIPER_CAN} is absent")
     result = subprocess.run(
-        ["ip", "-details", "link", "show", "can0"], check=True,
+        ["ip", "-details", "link", "show", PIPER_CAN], check=True,
         text=True, capture_output=True,
     )
     if "state UP" not in result.stdout or "bitrate 1000000" not in result.stdout:
-        raise RuntimeError("can0 is not UP at 1 Mbps")
-    print("OK can0: UP at 1 Mbps")
+        raise RuntimeError(f"{PIPER_CAN} is not UP at 1 Mbps")
+    print(f"OK {PIPER_CAN}: UP at 1 Mbps")
 
     import pyrealsense2 as rs
     devices = list(rs.context().query_devices())

@@ -1,15 +1,18 @@
-# PICO–PiPER Teleoperation
+# PICO–PiPER–Tracer Teleoperation
 
-PICO 오른쪽 컨트롤러로 PiPER 한 대를 조작하고, 손목 RealSense 영상과
-로봇/XR 데이터를 함께 저장한다.
+오른쪽 PICO 컨트롤러로 PiPER를, 왼쪽 컨트롤러로 Tracer Mini를 조작한다.
+손목 RealSense 영상과 로봇/XR 데이터를 같은 episode에 저장한다.
 
 ## 조작
 
 - 오른쪽 grip: 누르는 동안 이동
 - 오른쪽 trigger: 그리퍼
-- A 버튼: 정상 종료(시작 자세 복귀 후 토크 해제)
-- B 버튼: 비상정지
-- Ctrl-C: 시작 자세 복귀 후 토크 해제
+- 왼쪽 grip + 왼쪽 stick: Tracer 전진/후진
+- 왼쪽 grip + 오른쪽 stick: Tracer 회전
+- A 버튼: 기본 home 복귀 후 토크 해제
+- B 버튼: 현재 자세 hold 및 전체 일시정지; grip 해제·stick 중앙 후 다시 누르면 재개
+- X 버튼: Tracer 범퍼 E-stop 해제
+- Ctrl-C: 기본 home 복귀 후 토크 해제
 
 ## 구성
 
@@ -20,6 +23,7 @@ single_piper_teleop/
   validate.py     에피소드 검증
   recover.py      CAN 중단 후 복구
   preflight.py    실행 전 점검
+tracer_mini/      Tracer PICO 제어와 E-stop 해제
 assets/           PiPER URDF
 src/              PiPER SDK, XR binding submodule
 ```
@@ -49,7 +53,7 @@ XRoboToolkit PC Service는 `/opt/apps/roboticsservice`에 별도로 설치되어
 
 ```text
 Tracking: Controller ON
-Mode: None
+Mode: Object
 Data & Control: Send ON
 Switch w/ A button: OFF
 Remote Vision Listen: OFF
@@ -74,13 +78,19 @@ env \
 ### 터미널 2: CAN
 
 ```bash
-cd ~/piper_teleop/src/piper_sdk/piper_sdk
-bash can_activate.sh can0 1000000
-ip -details link show can0
-timeout 3 candump can0
+sudo ip link set piper_can down 2>/dev/null || true
+sudo ip link set piper_can type can bitrate 1000000
+sudo ip link set piper_can up
+ip -details link show piper_can
+timeout 3 candump piper_can
+
+sudo ip link set tracer_can down 2>/dev/null || true
+sudo ip link set tracer_can type can bitrate 500000
+sudo ip link set tracer_can up
+timeout 3 candump tracer_can
 ```
 
-`can0`가 UP, 1 Mbps이고 PiPER 프레임이 계속 들어오는지 확인한다.
+`piper_can`이 UP, 1 Mbps이고 PiPER 프레임이 계속 들어오는지 확인한다.
 
 ```bash
 cd ~/piper_teleop
@@ -98,7 +108,26 @@ cd ~/piper_teleop
 컨트롤러 pose, grip, trigger, A/B 버튼, RealSense 기록을 확인한다. dry-run은
 로봇 명령을 보내지 않는다.
 
-### 터미널 3: live
+### 터미널 3: Tracer ROS2
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/tracer_ros2_ws/install/setup.bash
+ros2 launch tracer_base tracer_mini_base.launch.py port_name:=tracer_can
+```
+
+현재 Tracer ROS2 source의 `TracerStatus.msg`에는 `uint8 vehicle_state`가 있어야 하며,
+`tracer_messenger.hpp`가 `state.system_state.vehicle_state`를 publish해야 한다.
+
+```bash
+git -C ~/tracer_ros2_ws/src/tracer_ros2 apply \
+  ~/piper_teleop/tracer_mini/tracer_vehicle_state.patch
+cd ~/tracer_ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select tracer_msgs tracer_base
+```
+
+### 터미널 4: PiPER 단독 live
 
 로봇 작업 반경을 비우고 B 버튼을 준비한다.
 
@@ -109,6 +138,16 @@ cd ~/piper_teleop
 ```
 
 `READY`가 나오면 오른쪽 grip을 누른 상태에서 조작한다.
+
+### 터미널 4: PiPER + Tracer 통합 live
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/tracer_ros2_ws/install/setup.bash
+cd ~/piper_teleop
+/home/swaaniida/miniconda3/envs/piper-xr/bin/python -u \
+  -m single_piper_teleop.teleop --with-tracer
+```
 
 참조 ZIP의 고정 start/init pose를 사용할 때만:
 
@@ -125,7 +164,7 @@ cd ~/piper_teleop
 종료 절차를 실행한다.
 
 ```text
-명령 중단 → 세션 시작 자세 복귀(50%) → 도착 확인 → STANDBY → 토크 해제
+명령 중단 → 기본 home 복귀(50%) → 도착 확인 → STANDBY → 토크 해제
 ```
 
 토크 해제 때 팔이 처질 수 있으므로 팔을 지지한다. CAN 또는 피드백이 끊긴 경우에는
@@ -149,6 +188,7 @@ data/episodes/<episode-id>/
 - PC monotonic/wall timestamp
 - 명령 관절과 그리퍼
 - PiPER 관절, gripper, end pose, 상태, error, enable
+- Tracer 속도 명령, 상태, E-stop 상태
 - RGB/depth 경로, frame number, camera/PC timestamp
 
 최근 에피소드 검증:
@@ -166,7 +206,7 @@ episode=$(find data/episodes -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
 
 1. 팔을 지지한다.
 2. CAN을 다시 연결하고 1 Mbps로 활성화한다.
-3. `candump can0` 피드백을 확인한다.
+3. `candump piper_can` 피드백을 확인한다.
 4. 중단된 에피소드의 `metadata.json`에서 `session_start_joint_deg`를 확인한다.
 5. 복귀 경로를 비우고 6개 값을 전달한다.
 

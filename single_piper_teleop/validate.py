@@ -52,6 +52,8 @@ def validate(episode: Path) -> dict[str, Any]:
     tracking_errors = []
     status_errors = 0
     non_normal = 0
+    tracer_errors = 0
+    tracer_estops = 0
     # Commands are written after the feedback in the same sample. Compare each
     # active command with feedback at least 100ms later instead of pre-command feedback.
     future_index = 0
@@ -71,6 +73,10 @@ def validate(episode: Path) -> dict[str, Any]:
         if status:
             status_errors += int(status.get("error_code", 0) != 0)
             non_normal += int(status.get("arm_status", 0) != 0)
+        tracer = sample.get("tracer_status")
+        if tracer:
+            tracer_errors += int(tracer.get("error", 0) != 0)
+            tracer_estops += int(tracer.get("vehicle", 0) != 0)
 
     unique_frames: dict[int, dict[str, Any]] = {}
     missing_camera_refs = 0
@@ -106,6 +112,8 @@ def validate(episode: Path) -> dict[str, Any]:
         reasons.append(f"{non_monotonic_pc} non-monotonic PC timestamps")
     if status_errors or non_normal:
         reasons.append(f"robot status failures: errors={status_errors}, non_normal={non_normal}")
+    if tracer_errors or tracer_estops:
+        reasons.append(f"tracer status failures: errors={tracer_errors}, estop={tracer_estops}")
     if missing_files:
         reasons.append(f"{missing_files} camera files missing")
     if missing_camera_refs / len(samples) > 0.10:
@@ -134,6 +142,10 @@ def validate(episode: Path) -> dict[str, Any]:
                 "p95": percentile(tracking_errors, 0.95),
                 "max": max(tracking_errors) if tracking_errors else None,
             },
+        },
+        "tracer": {
+            "error_samples": tracer_errors,
+            "estop_samples": tracer_estops,
         },
         "camera": {
             "unique_frames": len(unique_frames),

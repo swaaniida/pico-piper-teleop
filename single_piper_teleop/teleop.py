@@ -14,22 +14,36 @@ import math
 import os
 from pathlib import Path
 import signal
+import socket
 import threading
 import time
 from typing import Any
 
+from geometry_msgs.msg import Twist
 import numpy as np
 import placo
+import rclpy
+from rclpy.signals import SignalHandlerOptions
 from scipy.spatial.transform import Rotation
+from tracer_msgs.msg import TracerStatus
 import xrobotoolkit_sdk as xrt
 from piper_sdk import C_PiperInterface_V2
 from .realsense import WristRealSense
+from tracer_mini.pico_teleop import (
+    DEADZONE as TRACER_DEADZONE,
+    GRIP_THRESHOLD as TRACER_GRIP_THRESHOLD,
+    INPUT_TIMEOUT_S as TRACER_INPUT_TIMEOUT_S,
+    axis as tracer_axis,
+    enable_commanded_mode,
+    send_hardware_reset,
+    stop_messages as stop_tracer,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 URDF = ROOT / "assets" / "piper_kinematics.urdf"
 EPISODES = ROOT / "data" / "episodes"
-CAN_NAME = "can0"
+CAN_NAME = "piper_can"
 CONTROL_HZ = 50.0
 DT = 1.0 / CONTROL_HZ
 
@@ -42,10 +56,14 @@ GRIPPER_OPEN_DEG = 101.4
 GRIPPER_CLOSED_DEG = 0.0
 MOVE_SPEED_PERCENT = 100
 INIT_MOVE_SPEED_PERCENT = 50
+DEFAULT_HOME_JOINTS_DEG = np.array([0.421, 0.0, 0.0, 0.347, 21.506, -1.274])
 JOINTS_START_DEG = np.array([-0.51, 0.49, 1.60, 3.96, 4.83, -8.33])
 JOINTS_INIT_DEG = np.array([-1.86, 23.84, -60.0, 1.60, 50.65, 0.0])
 POSE_MOVE_WAIT_S = 3.0
 FEEDBACK_STALE_S = 0.10
+TRACER_CAN_NAME = "tracer_can"
+TRACER_LINEAR_MPS = 0.15
+TRACER_ANGULAR_RAD_S = 0.40
 R_HEADSET_WORLD = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
 
@@ -202,8 +220,10 @@ def wait_for_pose(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if monitor_b and bool(xrt.get_B_button()):
-            piper.EmergencyStop(1)
-            raise EmergencyStopRequested("B emergency stop requested during return")
+            current, _, hz = piper_joints(piper)
+            if hz > 0:
+                send_arm(piper, current)
+            raise EmergencyStopRequested("B guarded hold requested during return")
         state = piper_snapshot(piper)
         if state["error_code"] != 0 or state["arm_status"] != 0:
             raise RuntimeError(f"return aborted by PiPER state: {state}")
@@ -235,6 +255,7 @@ def main() -> None:
     parser.add_argument("--zip-auto-pose", action="store_true", help="enable the ZIP's unvalidated connect/exit pose moves")
     parser.add_argument("--no-camera", action="store_true", help="disable wrist RealSense RGB-D recording")
     parser.add_argument("--camera-serial", default="816612060658")
+    parser.add_argument("--with-tracer", action="store_true", help="enable left-controller Tracer teleoperation")
     args = parser.parse_args()
     stop_requested = threading.Event()
 
@@ -245,7 +266,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     if not args.dry_run and not os.path.exists(f"/sys/class/net/{CAN_NAME}"):
-        raise RuntimeError("can0 is absent")
+        raise RuntimeError(f"{CAN_NAME} is absent")
+    if args.with_tracer and not os.path.exists(f"/sys/class/net/{TRACER_CAN_NAME}"):
+        raise RuntimeError(f"{TRACER_CAN_NAME} is absent")
 
     EPISODES.mkdir(parents=True, exist_ok=True)
     episode = EPISODES / time.strftime("%Y%m%d_%H%M%S")
@@ -265,7 +288,9 @@ def main() -> None:
             can_name=CAN_NAME, judge_flag=True, can_auto_init=True, dh_is_offset=0,
             start_sdk_joint_limit=False, start_sdk_gripper_limit=False,
         )
-        piper.ConnectPort()
+        # Feedback is already broadcast continuously. Avoid SDK PiperInit(),
+        # which sends three unrelated limit/firmware queries on every connect.
+        piper.ConnectPort(piper_init=False)
         time.sleep(1.0)
         joints, feedback_stamp, hz = piper_joints(piper)
         if hz <= 0:
@@ -275,6 +300,41 @@ def main() -> None:
             raise RuntimeError("PiPER feedback is absent")
     session_start_joints = joints.copy()
 
+    tracer_node = None
+    tracer_pub = None
+    tracer_can = None
+    tracer_state = {"vehicle": None, "error": None, "stamp": 0.0}
+    tracer_latched = False
+    tracer_reset_sent_at = None
+    previous_x = False
+    previous_b = False
+    paused = False
+    last_xr_ns = None
+    last_xr_change = time.monotonic()
+    if args.with_tracer:
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+        tracer_node = rclpy.create_node("pico_piper_tracer_teleop")
+        tracer_pub = tracer_node.create_publisher(Twist, "/cmd_vel", 10)
+
+        def tracer_status_callback(message: TracerStatus) -> None:
+            tracer_state["vehicle"] = int(message.vehicle_state)
+            tracer_state["error"] = int(message.error_code)
+            tracer_state["stamp"] = time.monotonic()
+
+        tracer_node.create_subscription(TracerStatus, "/tracer_status", tracer_status_callback, 10)
+        tracer_can = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        tracer_can.bind((TRACER_CAN_NAME,))
+        enable_commanded_mode(tracer_can)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and (
+            tracer_pub.get_subscription_count() == 0 or tracer_state["vehicle"] is None
+        ):
+            rclpy.spin_once(tracer_node, timeout_sec=0.05)
+        if tracer_pub.get_subscription_count() == 0 or tracer_state["vehicle"] is None:
+            raise RuntimeError("Tracer ROS feedback or /cmd_vel subscriber is absent")
+        if tracer_state["vehicle"] != 0 or tracer_state["error"] != 0:
+            raise RuntimeError(f"Tracer is not ready: {tracer_state}")
+
     ik = RightPicoIK()
     ik.sync(joints)
     clutch = False
@@ -282,7 +342,7 @@ def main() -> None:
     last_feedback_change = time.monotonic()
     unsafe_stop = False
     xrt.init()
-    print("XRoboToolkit initialized. Right grip=clutch, trigger=gripper, B=stop.")
+    print("XRoboToolkit initialized. Right grip=PiPER, left grip=Tracer, B=stop.")
     if not args.dry_run:
         countdown()
         # Enable while holding only the measured joint pose.
@@ -328,6 +388,10 @@ def main() -> None:
         "grip_threshold": GRIP_THRESHOLD,
         "zip_auto_pose": args.zip_auto_pose,
         "session_start_joint_deg": session_start_joints.tolist(),
+        "default_home_joint_deg": DEFAULT_HOME_JOINTS_DEG.tolist(),
+        "tracer_enabled": args.with_tracer,
+        "tracer_max_linear_mps": TRACER_LINEAR_MPS if args.with_tracer else None,
+        "tracer_max_angular_rad_s": TRACER_ANGULAR_RAD_S if args.with_tracer else None,
         "status": "recording",
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -337,24 +401,106 @@ def main() -> None:
     torque_released = False
     print("READY")
     try:
+        if piper is not None and not args.zip_auto_pose:
+            print("Moving to default home pose...")
+            wait_for_pose(piper, DEFAULT_HOME_JOINTS_DEG, monitor_b=True)
+            joints, feedback_stamp, _ = piper_joints(piper)
+            ik.sync(joints)
+            last_command = joints.copy()
         with samples_path.open("w", encoding="utf-8") as log:
             while not stop_requested.is_set():
                 started = time.monotonic()
                 pose = np.asarray(xrt.get_right_controller_pose(), dtype=float)
                 grip = float(xrt.get_right_grip())
                 trigger = float(xrt.get_right_trigger())
+                left_axis = list(xrt.get_left_axis())
+                right_axis = list(xrt.get_right_axis())
+                left_grip = float(xrt.get_left_grip())
                 xr_ns = int(xrt.get_time_stamp_ns())
+                if xr_ns != last_xr_ns:
+                    last_xr_ns = xr_ns
+                    last_xr_change = started
+                xr_stale = started - last_xr_change > TRACER_INPUT_TIMEOUT_S
                 if pose.shape != (7,) or not np.all(np.isfinite(pose)):
                     raise RuntimeError("invalid right-controller pose")
-                if bool(xrt.get_B_button()):
-                    if piper is not None:
-                        piper.EmergencyStop(1)
-                    unsafe_stop = True
-                    raise RuntimeError("B emergency stop requested")
+                b_pressed = bool(xrt.get_B_button())
+                sticks_neutral = (
+                    abs(float(left_axis[1])) <= TRACER_DEADZONE
+                    and abs(float(right_axis[0])) <= TRACER_DEADZONE
+                )
+                if b_pressed and not previous_b:
+                    if paused:
+                        if (
+                            grip <= GRIP_THRESHOLD
+                            and left_grip <= TRACER_GRIP_THRESHOLD
+                            and sticks_neutral
+                            and not xr_stale
+                        ):
+                            paused = False
+                            print("B: teleoperation resumed")
+                        else:
+                            print("B resume ignored: release both grips and center sticks")
+                    else:
+                        stop_tracer(tracer_pub, tracer_node, count=10)
+                        if piper is not None:
+                            current, _, hz = piper_joints(piper)
+                            if hz > 0:
+                                send_arm(piper, current)
+                                joints = current
+                                last_command = current.copy()
+                        if clutch:
+                            ik.deactivate()
+                            clutch = False
+                        paused = True
+                        print("B: all teleoperation paused; torque held")
 
                 if bool(xrt.get_A_button()):
                     print("A: normal stop requested")
                     break
+
+                x_pressed = bool(xrt.get_X_button())
+                tracer_command = {"linear_mps": 0.0, "angular_rad_s": 0.0}
+                if tracer_node is not None:
+                    rclpy.spin_once(tracer_node, timeout_sec=0.0)
+                    status_fresh = started - tracer_state["stamp"] <= TRACER_INPUT_TIMEOUT_S
+                    if status_fresh and tracer_state["vehicle"] == 1:
+                        tracer_latched = True
+                    if tracer_reset_sent_at is not None and tracer_state["stamp"] > tracer_reset_sent_at:
+                        if tracer_state["vehicle"] == 0 and tracer_state["error"] == 0:
+                            enable_commanded_mode(tracer_can)
+                            tracer_latched = False
+                            tracer_reset_sent_at = None
+                            print("Tracer E-stop cleared")
+                        elif started - tracer_reset_sent_at > 1.0:
+                            tracer_reset_sent_at = None
+                            print("Tracer E-stop remains active")
+
+                    if x_pressed and not previous_x and tracer_latched:
+                        if left_grip <= TRACER_GRIP_THRESHOLD and sticks_neutral and not xr_stale:
+                            stop_tracer(tracer_pub, tracer_node, count=3)
+                            send_hardware_reset(tracer_can)
+                            tracer_reset_sent_at = time.monotonic()
+                            print("X: Tracer E-stop reset requested")
+                        else:
+                            print("X ignored: release left grip and center sticks")
+
+                    tracer_ready = (
+                        status_fresh
+                        and tracer_state["vehicle"] == 0
+                        and tracer_state["error"] == 0
+                        and not tracer_latched
+                        and not xr_stale
+                        and not paused
+                    )
+                    if left_grip > TRACER_GRIP_THRESHOLD and tracer_ready:
+                        tracer_command["linear_mps"] = tracer_axis(left_axis[1]) * TRACER_LINEAR_MPS
+                        tracer_command["angular_rad_s"] = -tracer_axis(right_axis[0]) * TRACER_ANGULAR_RAD_S
+                    twist = Twist()
+                    twist.linear.x = tracer_command["linear_mps"]
+                    twist.angular.z = tracer_command["angular_rad_s"]
+                    tracer_pub.publish(twist)
+                previous_x = x_pressed
+                previous_b = b_pressed
 
                 state = None
                 if piper is not None:
@@ -374,7 +520,7 @@ def main() -> None:
                         raise RuntimeError("stale PiPER feedback")
                     ik.sync(joints)
 
-                next_clutch = grip > GRIP_THRESHOLD
+                next_clutch = grip > GRIP_THRESHOLD and not paused
                 if next_clutch and not clutch:
                     ik.activate(pose)
                     last_command = joints.copy()
@@ -402,12 +548,17 @@ def main() -> None:
                     "right_pose_xyzw": pose.tolist(),
                     "right_grip": grip,
                     "right_trigger": trigger,
-                    "right_axis": list(xrt.get_right_axis()),
+                    "right_axis": right_axis,
+                    "left_axis": left_axis,
+                    "left_grip": left_grip,
+                    "paused": paused,
                     "clutch_active": clutch,
                     "commanded_joint_deg": target.tolist(),
                     "commanded_gripper_deg": gripper_target,
                     "piper_joint_deg": joints.tolist(),
                     "piper_status": state,
+                    "tracer_command": tracer_command,
+                    "tracer_status": dict(tracer_state) if tracer_node is not None else None,
                     "dry_run": args.dry_run,
                     "camera_frame_reference": camera.latest() if camera is not None else None,
                 }
@@ -421,6 +572,10 @@ def main() -> None:
     finally:
         print("Episode saved:", samples_path)
         try:
+            stop_tracer(tracer_pub, tracer_node, count=10)
+        except Exception as exc:
+            cleanup_errors.append(f"tracer_stop: {type(exc).__name__}: {exc}")
+        try:
             if camera is not None:
                 camera.stop()
         except Exception as exc:
@@ -429,13 +584,19 @@ def main() -> None:
             xrt.close()
         except Exception as exc:
             cleanup_errors.append(f"xr: {type(exc).__name__}: {exc}")
+        if tracer_can is not None:
+            tracer_can.close()
+        if tracer_node is not None:
+            tracer_node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
         if piper is not None:
             try:
                 # Normal exit: return first, confirm arrival, enter standby, then release torque.
                 # B/error/stale feedback: never add motion or release supporting torque here.
                 if not unsafe_stop:
-                    return_target = JOINTS_START_DEG if args.zip_auto_pose else session_start_joints
-                    label = "ZIP start pose" if args.zip_auto_pose else "session start pose"
+                    return_target = JOINTS_START_DEG if args.zip_auto_pose else DEFAULT_HOME_JOINTS_DEG
+                    label = "ZIP start pose" if args.zip_auto_pose else "default home pose"
                     print(f"Returning to {label} before torque release...")
                     wait_for_pose(piper, return_target, monitor_b=True)
                     return_confirmed = True
