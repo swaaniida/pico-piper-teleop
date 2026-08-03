@@ -188,10 +188,22 @@ def move_to_pose(piper: C_PiperInterface_V2, joints_deg: np.ndarray) -> None:
     piper.JointCtrl(*(int(round(v * 1000.0)) for v in joints_deg))
 
 
-def wait_for_pose(piper: C_PiperInterface_V2, target: np.ndarray, timeout_s: float = 10.0) -> None:
+class EmergencyStopRequested(RuntimeError):
+    pass
+
+
+def wait_for_pose(
+    piper: C_PiperInterface_V2,
+    target: np.ndarray,
+    timeout_s: float = 10.0,
+    monitor_b: bool = False,
+) -> None:
     """Stream a return target until feedback confirms it before torque release."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if monitor_b and bool(xrt.get_B_button()):
+            piper.EmergencyStop(1)
+            raise EmergencyStopRequested("B emergency stop requested during return")
         state = piper_snapshot(piper)
         if state["error_code"] != 0 or state["arm_status"] != 0:
             raise RuntimeError(f"return aborted by PiPER state: {state}")
@@ -257,6 +269,9 @@ def main() -> None:
         time.sleep(1.0)
         joints, feedback_stamp, hz = piper_joints(piper)
         if hz <= 0:
+            piper.DisconnectPort()
+            if camera is not None:
+                camera.stop()
             raise RuntimeError("PiPER feedback is absent")
     session_start_joints = joints.copy()
 
@@ -336,6 +351,10 @@ def main() -> None:
                         piper.EmergencyStop(1)
                     unsafe_stop = True
                     raise RuntimeError("B emergency stop requested")
+
+                if bool(xrt.get_A_button()):
+                    print("A: normal stop requested")
+                    break
 
                 state = None
                 if piper is not None:
@@ -418,7 +437,7 @@ def main() -> None:
                     return_target = JOINTS_START_DEG if args.zip_auto_pose else session_start_joints
                     label = "ZIP start pose" if args.zip_auto_pose else "session start pose"
                     print(f"Returning to {label} before torque release...")
-                    wait_for_pose(piper, return_target)
+                    wait_for_pose(piper, return_target, monitor_b=True)
                     return_confirmed = True
                     piper.MotionCtrl_2(0x00, 0x01, INIT_MOVE_SPEED_PERCENT, 0x00)
                     time.sleep(0.5)
@@ -427,6 +446,8 @@ def main() -> None:
                     torque_released = not any(piper.GetArmEnableStatus())
                     print("Return confirmed; arm torque released.")
             except Exception as exc:
+                if isinstance(exc, EmergencyStopRequested):
+                    unsafe_stop = True
                 cleanup_errors.append(f"robot: {type(exc).__name__}: {exc}")
             finally:
                 piper.DisconnectPort()

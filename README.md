@@ -7,7 +7,8 @@ PICO 오른쪽 컨트롤러로 PiPER 한 대를 조작하고, 손목 RealSense �
 
 - 오른쪽 grip: 누르는 동안 이동
 - 오른쪽 trigger: 그리퍼
-- B: 비상정지
+- A 버튼: 정상 종료(시작 자세 복귀 후 토크 해제)
+- B 버튼: 비상정지
 - Ctrl-C: 시작 자세 복귀 후 토크 해제
 
 ## 구성
@@ -94,7 +95,7 @@ cd ~/piper_teleop
   -m single_piper_teleop.teleop --dry-run
 ```
 
-컨트롤러 pose, grip, trigger, B 버튼, RealSense 기록을 확인한다. dry-run은
+컨트롤러 pose, grip, trigger, A/B 버튼, RealSense 기록을 확인한다. dry-run은
 로봇 명령을 보내지 않는다.
 
 ### 터미널 3: live
@@ -120,7 +121,8 @@ cd ~/piper_teleop
 
 ## 종료
 
-Ctrl-C를 한 번 누른다. 정상 종료 순서는 다음과 같다.
+터미널에서 Ctrl-C를 한 번 누르거나 PICO의 A 버튼을 누른다. 둘 다 같은 정상
+종료 절차를 실행한다.
 
 ```text
 명령 중단 → 세션 시작 자세 복귀(50%) → 도착 확인 → STANDBY → 토크 해제

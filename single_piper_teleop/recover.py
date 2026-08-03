@@ -51,8 +51,8 @@ def require_ok(piper: C_PiperInterface_V2, last_stamp: float, last_change: float
 
 
 def send(piper: C_PiperInterface_V2, target: tuple[int, ...], mode: int) -> None:
+    piper.MotionCtrl_2(mode, 0x01, MOVE_SPEED_PERCENT, 0x00)
     piper.JointCtrl(*target)
-    piper.ModeCtrl(mode, 0x01, MOVE_SPEED_PERCENT, 0x00)
 
 
 def main() -> None:
@@ -61,6 +61,10 @@ def main() -> None:
         "--target", nargs=6, required=True, type=float,
         metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
         help="session_start_joint_deg from the episode metadata",
+    )
+    parser.add_argument(
+        "--keep-enabled", action="store_true",
+        help="hold the reached target instead of entering STANDBY and releasing torque",
     )
     args = parser.parse_args()
     target_final = tuple(int(round(value * 1000.0)) for value in args.target)
@@ -135,6 +139,11 @@ def main() -> None:
         final_error = tuple(result[i] - target_final[i] for i in range(6))
         if any(abs(value) > FINAL_TOLERANCE for value in final_error):
             raise RuntimeError(f"final tolerance exceeded: {final_error}")
+
+        if args.keep_enabled:
+            print("Result (0.001 deg):", result)
+            print("Target reached; torque remains enabled.")
+            return
 
         # Hold the achieved target while returning control mode to STANDBY.
         deadline = time.monotonic() + 0.5
