@@ -4,7 +4,6 @@
 import argparse
 import signal
 import socket
-import struct
 import threading
 import time
 
@@ -14,22 +13,19 @@ from rclpy.signals import SignalHandlerOptions
 from tracer_msgs.msg import TracerStatus
 import xrobotoolkit_sdk as xrt
 
+from .control import (
+    DEADZONE,
+    DEFAULT_ANGULAR_RAD_S,
+    DEFAULT_LINEAR_MPS,
+    GRIP_THRESHOLD,
+    INPUT_TIMEOUT_S,
+    axis,
+    enable_commanded_mode,
+    send_hardware_reset,
+)
+
 
 CONTROL_HZ = 20.0
-DEADZONE = 0.15
-GRIP_THRESHOLD = 0.9
-INPUT_TIMEOUT_S = 0.2
-DEFAULT_LINEAR_MPS = 0.15
-DEFAULT_ANGULAR_RAD_S = 0.40
-STATE_RESET_CAN_ID = 0x441
-CONTROL_MODE_CAN_ID = 0x421
-
-
-def axis(value: float) -> float:
-    value = max(-1.0, min(1.0, float(value)))
-    if abs(value) <= DEADZONE:
-        return 0.0
-    return (abs(value) - DEADZONE) / (1.0 - DEADZONE) * (1.0 if value > 0 else -1.0)
 
 
 def stop_messages(pub, node, count: int = 10) -> None:
@@ -39,18 +35,6 @@ def stop_messages(pub, node, count: int = 10) -> None:
     for _ in range(count):
         pub.publish(message)
         rclpy.spin_once(node, timeout_sec=0.01)
-
-
-def send_hardware_reset(can_socket: socket.socket) -> None:
-    """Send the official Tracer V2 'clear all errors' frame (0x441#00)."""
-    frame = struct.pack("=IB3x8s", STATE_RESET_CAN_ID, 1, b"\x00".ljust(8, b"\x00"))
-    can_socket.send(frame)
-
-
-def enable_commanded_mode(can_socket: socket.socket) -> None:
-    """Match ugv_sdk EnableCommandedMode(): 0x421, mode 0x01, DLC 8."""
-    frame = struct.pack("=IB3x8s", CONTROL_MODE_CAN_ID, 8, b"\x01" + b"\x00" * 7)
-    can_socket.send(frame)
 
 
 def main() -> None:

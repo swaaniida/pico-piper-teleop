@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pico-piper-tracer-teleop"
 version = "0.2.0"
-description = "Synchronized PICO teleoperation and RGB-D capture for PiPER and Tracer Mini"
+description = "Synchronized PICO teleoperation and camera capture for PiPER and Tracer Mini"
 requires-python = ">=3.10"
 dependencies = [
-  "numpy",
-  "scipy",
+  "numpy==2.2.6",
+  "scipy==1.15.3",
   "placo==0.9.23",
-  "pyrealsense2==2.58.2.10647",
+  "opencv-python-headless==5.0.0.93",
 ]
 
 [project.scripts]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate timing, command tracking, robot status, and RGB-D references."""
+"""Validate timing, command tracking, robot status, and camera references."""
 
 import argparse
 import json
@@ -30,6 +30,47 @@ def load_samples(path: Path) -> tuple[list[dict[str, Any]], int]:
             except json.JSONDecodeError:
                 malformed += 1
     return samples, malformed
+
+
+def camera_stats(
+    episode: Path,
+    samples: list[dict[str, Any]],
+    reference_key: str,
+    file_keys: tuple[str, ...],
+    duration_s: float,
+) -> dict[str, Any]:
+    unique_frames: dict[int, dict[str, Any]] = {}
+    missing_references = 0
+    frame_age_ms = []
+    missing_files = 0
+    for sample in samples:
+        ref = sample.get(reference_key)
+        if not ref:
+            missing_references += 1
+            continue
+        number = int(ref["frame_number"])
+        unique_frames[number] = ref
+        frame_age_ms.append(
+            (int(sample["timestamp_monotonic_ns"]) - int(ref["timestamp_monotonic_ns"])) / 1e6
+        )
+    for ref in unique_frames.values():
+        for key in file_keys:
+            if not (episode / ref[key]).is_file():
+                missing_files += 1
+    frame_numbers = sorted(unique_frames)
+    dropped_frames = sum(max(0, b - a - 1) for a, b in zip(frame_numbers, frame_numbers[1:]))
+    return {
+        "unique_frames": len(unique_frames),
+        "rate_hz": len(unique_frames) / duration_s if duration_s > 0 else 0.0,
+        "dropped_frame_numbers": dropped_frames,
+        "missing_references": missing_references,
+        "missing_files": missing_files,
+        "sample_frame_age_ms": {
+            "median": percentile(frame_age_ms, 0.5),
+            "p95": percentile(frame_age_ms, 0.95),
+            "max": max(frame_age_ms) if frame_age_ms else None,
+        },
+    }
 
 
 def validate(episode: Path) -> dict[str, Any]:
@@ -78,34 +119,27 @@ def validate(episode: Path) -> dict[str, Any]:
             tracer_errors += int(tracer.get("error", 0) != 0)
             tracer_estops += int(tracer.get("vehicle", 0) != 0)
 
-    unique_frames: dict[int, dict[str, Any]] = {}
-    missing_camera_refs = 0
-    camera_age_ms = []
-    missing_files = 0
-    for sample in samples:
-        ref = sample.get("camera_frame_reference")
-        if not ref:
-            missing_camera_refs += 1
-            continue
-        number = int(ref["frame_number"])
-        unique_frames[number] = ref
-        camera_age_ms.append((int(sample["timestamp_monotonic_ns"]) - int(ref["timestamp_monotonic_ns"])) / 1e6)
-    for ref in unique_frames.values():
-        for key in ("color_path", "depth_path"):
-            if not (episode / ref[key]).is_file():
-                missing_files += 1
-    frame_numbers = sorted(unique_frames)
-    dropped_frames = sum(max(0, b - a - 1) for a, b in zip(frame_numbers, frame_numbers[1:]))
-    camera_rate = len(unique_frames) / duration_s if duration_s > 0 else 0.0
+    wrist_has_depth = bool(
+        metadata.get(
+            "wrist_camera_has_depth",
+            metadata.get("wrist_camera_type", "realsense_rgbd") == "realsense_rgbd",
+        )
+    ) if metadata else True
+    wrist_file_keys = ("color_path", "depth_path") if wrist_has_depth else ("color_path",)
+    wrist_camera = camera_stats(
+        episode, samples, "camera_frame_reference", wrist_file_keys, duration_s
+    )
+    global_camera = camera_stats(
+        episode, samples, "global_camera_frame_reference", ("color_path",), duration_s
+    )
 
     reasons = []
     if metadata is None:
         reasons.append("episode metadata missing")
     elif metadata.get("status") != "complete":
         reasons.append(f"episode status is {metadata.get('status')}")
-    elif not metadata.get("dry_run", False) and not metadata.get("unsafe_stop", False):
-        if not metadata.get("return_confirmed") or not metadata.get("torque_released"):
-            reasons.append("normal shutdown did not confirm return and torque release")
+    elif not metadata.get("dry_run", False) and not metadata.get("returned_to_episode_home", False):
+        reasons.append("episode did not confirm return to its init pose")
     if malformed:
         reasons.append(f"{malformed} malformed JSON lines")
     if non_monotonic_pc:
@@ -114,16 +148,28 @@ def validate(episode: Path) -> dict[str, Any]:
         reasons.append(f"robot status failures: errors={status_errors}, non_normal={non_normal}")
     if tracer_errors or tracer_estops:
         reasons.append(f"tracer status failures: errors={tracer_errors}, estop={tracer_estops}")
-    if missing_files:
-        reasons.append(f"{missing_files} camera files missing")
-    if missing_camera_refs / len(samples) > 0.10:
-        reasons.append(f"camera references missing in {missing_camera_refs}/{len(samples)} samples")
+    if wrist_camera["missing_files"]:
+        reasons.append(f"{wrist_camera['missing_files']} wrist camera files missing")
+    if global_camera["missing_files"]:
+        reasons.append(f"{global_camera['missing_files']} global camera files missing")
+    if metadata and metadata.get("wrist_camera_enabled", metadata.get("camera_enabled", False)):
+        if wrist_camera["missing_references"] / len(samples) > 0.10:
+            reasons.append(
+                f"wrist camera references missing in {wrist_camera['missing_references']}/{len(samples)} samples"
+            )
+        if wrist_camera["unique_frames"] and wrist_camera["rate_hz"] < 20.0:
+            reasons.append(f"wrist camera frame rate too low: {wrist_camera['rate_hz']:.1f}Hz")
+    if metadata and metadata.get("global_camera_enabled", False):
+        if global_camera["missing_references"] / len(samples) > 0.10:
+            reasons.append(
+                f"global camera references missing in {global_camera['missing_references']}/{len(samples)} samples"
+            )
+        if global_camera["unique_frames"] and global_camera["rate_hz"] < 10.0:
+            reasons.append(f"global camera frame rate too low: {global_camera['rate_hz']:.1f}Hz")
     if not samples[0].get("dry_run", False) and tracking_errors and (percentile(tracking_errors, 0.95) or 0) > 5.0:
         reasons.append("joint tracking p95 exceeds 5 degrees")
     if rates < 35.0:
         reasons.append(f"control sample rate too low: {rates:.1f}Hz")
-    if unique_frames and camera_rate < 20.0:
-        reasons.append(f"camera frame rate too low: {camera_rate:.1f}Hz")
 
     return {
         "valid": not reasons,
@@ -147,18 +193,9 @@ def validate(episode: Path) -> dict[str, Any]:
             "error_samples": tracer_errors,
             "estop_samples": tracer_estops,
         },
-        "camera": {
-            "unique_frames": len(unique_frames),
-            "rate_hz": camera_rate,
-            "dropped_frame_numbers": dropped_frames,
-            "missing_references": missing_camera_refs,
-            "missing_files": missing_files,
-            "sample_frame_age_ms": {
-                "median": percentile(camera_age_ms, 0.5),
-                "p95": percentile(camera_age_ms, 0.95),
-                "max": max(camera_age_ms) if camera_age_ms else None,
-            },
-        },
+        "camera": wrist_camera,
+        "wrist_camera": wrist_camera,
+        "global_camera": global_camera,
     }
 
 

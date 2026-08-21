@@ -22,7 +22,7 @@ def main() -> None:
     parser.add_argument("--software-only", action="store_true")
     args = parser.parse_args()
 
-    for module in ("numpy", "scipy", "placo", "pyrealsense2", "piper_sdk", "xrobotoolkit_sdk"):
+    for module in ("numpy", "scipy", "placo", "cv2", "piper_sdk", "xrobotoolkit_sdk"):
         check_import(module)
 
     urdf = ROOT / "assets" / "piper_kinematics.urdf"
@@ -49,11 +49,16 @@ def main() -> None:
         raise RuntimeError(f"{PIPER_CAN} is not UP at 1 Mbps")
     print(f"OK {PIPER_CAN}: UP at 1 Mbps")
 
-    import pyrealsense2 as rs
-    devices = list(rs.context().query_devices())
-    if not devices:
-        raise RuntimeError("no RealSense device detected")
-    print("OK RealSense:", ", ".join(device.get_info(rs.camera_info.serial_number) for device in devices))
+    import cv2
+    from .wrist_camera import find_innomaker_device
+
+    device = find_innomaker_device()
+    capture = cv2.VideoCapture(device, cv2.CAP_V4L2)
+    ok, frame = capture.read() if capture.isOpened() else (False, None)
+    capture.release()
+    if not ok or frame is None:
+        raise RuntimeError(f"InnoMaker wrist camera produced no frame: {device}")
+    print(f"OK InnoMaker wrist camera: {device} {frame.shape[1]}x{frame.shape[0]}")
 
 
 if __name__ == "__main__":

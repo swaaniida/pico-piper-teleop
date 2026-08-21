@@ -1,0 +1,6 @@
+[Match]
+Property=ID_SERIAL_SHORT=002000235246571220393733
+Driver=gs_usb
+
+[Link]
+Name=tracer_can

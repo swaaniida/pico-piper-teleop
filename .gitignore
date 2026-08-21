@@ -6,12 +6,13 @@ __pycache__/
 .venv/
 
 # Hardware recordings and generated episode data
-data/episodes/
+data/
 recordings/
 logs/
 
 # Local hardware bring-up history retained outside the compact GitHub app
 scripts/
-config/
+config/*
+!config/*.link
 AGENTS.md
 docs/

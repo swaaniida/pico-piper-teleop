@@ -1,0 +1,6 @@
+[Match]
+Property=ID_SERIAL_SHORT=002C001D5746570A20383839
+Driver=gs_usb
+
+[Link]
+Name=piper_can
