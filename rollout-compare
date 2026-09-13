@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "$ROOT/rollout-shadow" \
+  "$ROOT/checkpoints/act-absolute-step-200000/floor-1ball-act-absolute-step-200000" \
+  "$ROOT/checkpoints/act-downsample-240x320-b16-step-200000/floor-1ball-act-downsample-240x320-b16-step-200000" \
+  "$ROOT/checkpoints/act-downsample-240x320-b64-step-50000/floor-1ball-act-downsample-240x320-b64-step-50000" \
+  "$@"

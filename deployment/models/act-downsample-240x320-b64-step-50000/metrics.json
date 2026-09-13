@@ -1,0 +1,19 @@
+{
+  "selected_step": 50000,
+  "validation": {
+    "available": false,
+    "reason": "Training config has env=null; no validation or physical rollout metric was recorded."
+  },
+  "final_training_log": {
+    "timestamp_utc": "2026-09-13T14:45:03Z",
+    "loss": 0.028,
+    "gradient_norm": 1.725,
+    "learning_rate": 1e-05,
+    "update_seconds": 0.238,
+    "data_seconds": 0.277,
+    "samples_seen": 3200000,
+    "wandb_project": "floor-1ball",
+    "wandb_run_id": "si81zpqf"
+  },
+  "selection_basis": "Last checkpoint from the completed 50000-step run; not claimed as best because no validation or rollout comparison exists."
+}

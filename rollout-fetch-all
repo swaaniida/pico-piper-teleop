@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${PIPER_ROLLOUT_PYTHON:-python3}"
+for model in \
+  act-absolute-step-200000 \
+  act-downsample-240x320-b16-step-200000 \
+  act-downsample-240x320-b64-step-50000
+do
+  "$PYTHON" "$ROOT/tools/fetch_rollout_model.py" "$model"
+done

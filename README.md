@@ -356,6 +356,19 @@ floor-1ball-act-downsample-240x320-b16-step-200000 \
 `docs/INFERENCE_ROLLOUT.md`를 따른다. 현재 `rollout-shadow`에는 의도적으로 actuator
 송신 코드가 없다.
 
+게시된 세 ACT 모델을 같은 local/global frame과 robot state로 비교하면서 영상을
+저장하려면 다음을 사용한다.
+
+```bash
+./rollout-fetch-all
+./rollout-setup
+./rollout-compare --seconds 60
+```
+
+각 실행은 `log/rollout-shadow-<timestamp>/`에 `local.avi`, `global.avi`, 모델별
+action/latency가 든 `samples.jsonl`을 저장한다. 세 번째 batch-64 모델은 200k가 아닌
+정상 종료된 50k checkpoint다.
+
 ## VM 삭제 전 확인
 
 Git에는 소스, submodule 커밋, ROS2 패치와 CAN serial 규칙만 저장한다. 다음 항목은

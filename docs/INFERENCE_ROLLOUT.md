@@ -262,8 +262,9 @@ hardware adapter가 완성되기 전에는 이 repository의 전용 rollout loop
 |---|---|---|---|
 | `act-absolute-step-200000` | `floor-1ball-act-absolute-step-200000` | 480×640 | 원본 해상도 |
 | `act-downsample-240x320-b16-step-200000` | `floor-1ball-act-downsample-240x320-b16-step-200000` | 240×320 | torchvision antialias resize |
+| `act-downsample-240x320-b64-step-50000` | `floor-1ball-act-downsample-240x320-b64-step-50000` | 240×320 | batch 64, 정상 종료 50k |
 
-둘 다 LeRobot 0.4.4, absolute 9D action, `chunk_size=100`,
+세 모델 모두 LeRobot 0.4.4, absolute 9D action, `chunk_size=100`,
 `n_action_steps=100`, temporal ensemble 없음이다. validation/physical rollout metric은
 없으므로 마지막 training loss만으로 우열을 정하지 않는다.
 
@@ -288,11 +289,32 @@ floor-1ball-act-downsample-240x320-b16-step-200000 \
 ```
 
 `rollout-shadow`는 PiPER/Tracer feedback과 두 카메라를 읽고 policy output 및 final
-safety gate 결과만 `log/rollout-shadow.jsonl`에 기록한다. PiPER enable, JointCtrl,
+safety gate 결과를 timestamp별 `log/rollout-shadow-*/samples.jsonl`에 기록한다. PiPER enable, JointCtrl,
 GripperCtrl, `/cmd_vel` 명령은 호출하지 않는다.
 
 `rollout-setup`도 XRoboToolkit/PICO service를 시작하지 않는다. SocketCAN, Tracer ROS,
 학습과 동일한 두 camera fanout만 준비한 뒤 feedback을 read-only로 확인한다.
+
+세 모델을 같은 observation으로 비교하고 local/global 영상을 저장하려면:
+
+```bash
+./rollout-fetch-all
+./rollout-setup
+./rollout-compare --seconds 60
+```
+
+결과는 timestamp가 붙은 `log/rollout-shadow-*/`에 생성된다.
+
+```text
+metadata.json   # 모델 목록, tick 수, 경과시간, deadline miss
+samples.jsonl   # frame별 state, 모델별 raw/gated action, inference latency
+local.avi       # MJPEG 640x480 30 fps
+global.avi      # MJPEG 640x480 30 fps
+```
+
+두 영상의 frame N과 `samples.jsonl`의 `video_frame_index=N`은 동일한 관측이다.
+JSONL의 wall/monotonic timestamp가 정확한 시간 기준이며 영상에는 aid/REC text를
+burn-in하지 않는다.
 
 ACT의 현재 `select_action()`은 checkpoint에 저장된 100개 action queue를 소비하므로
 첫 추론 이후 약 2초 동안 새 관측이 제어에 반영되지 않는다. 이 동작은 학습 config와
@@ -361,7 +383,7 @@ shadow test를 한다. 그 다음 PiPER만 낮은 speed limit, 그 다음 Tracer
 
 ## 10. Eddy에서 받은 정보와 남은 항목
 
-다음 항목은 두 Release/metadata commit에서 확보됐다.
+다음 항목은 세 Release/metadata commit에서 확보됐다.
 
 - model ID와 policy type
 - selected checkpoint directory
