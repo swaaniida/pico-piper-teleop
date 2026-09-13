@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "model_id": "act-downsample-240x320-b64-step-50000",
+  "policy_type": "act",
+  "source_git_commit": "3b0e3daccbf65b342d51dd25a1f82bbbeee59b66",
+  "training_dataset": {
+    "repo_id": "swaaniida/floor-1ball",
+    "revision": "cf04444d8d3d8826842639c18200b410c3cd044b",
+    "episodes": 49,
+    "fps": 50
+  },
+  "software": {
+    "lerobot_version": "0.4.4",
+    "torch_version": "2.6.0+cu124",
+    "torchvision_version": "0.21.0+cu124",
+    "cuda_runtime": "12.4",
+    "training_container_digest": "sha256:5c53d50673fbc7f50d27189d3068d4f4426053602bac05d8cdc9e11d65e21442"
+  },
+  "features": {
+    "image_keys": [
+      "observation.images.local",
+      "observation.images.global"
+    ],
+    "image_shape_hwc": [480, 640, 3],
+    "policy_input_shape_chw": [3, 240, 320],
+    "state_key": "observation.state",
+    "state_names": [
+      "joint_1_rad",
+      "joint_2_rad",
+      "joint_3_rad",
+      "joint_4_rad",
+      "joint_5_rad",
+      "joint_6_rad",
+      "gripper_mm",
+      "base_linear_mps",
+      "base_angular_rad_s"
+    ],
+    "action_key": "action",
+    "action_names": [
+      "joint_1_rad",
+      "joint_2_rad",
+      "joint_3_rad",
+      "joint_4_rad",
+      "joint_5_rad",
+      "joint_6_rad",
+      "gripper_mm",
+      "base_linear_mps",
+      "base_angular_rad_s"
+    ]
+  },
+  "action_representation": "absolute",
+  "chunk_size": 100,
+  "n_action_steps": 100,
+  "temporal_ensemble_coeff": null,
+  "checkpoint": {
+    "selected_step": 50000,
+    "selection_reason": "Last checkpoint from the normally completed 50000-step batch-64 run; no validation environment or physical rollout metric was available.",
+    "pretrained_model_directory": "pretrained_model",
+    "source_path_on_eddy": "/media/moai/data2/swaaniida/floor-1ball/outputs/act-downsample-b64-numworkers16/checkpoints/050000/pretrained_model",
+    "source_size_bytes": 206761202
+  },
+  "training_image_transforms": {
+    "enable": true,
+    "max_num_transforms": 1,
+    "random_order": false,
+    "resize": {
+      "size_hw": [240, 320],
+      "antialias": true
+    }
+  },
+  "camera_preprocessing": {
+    "local": "1280x720 MJPEG -> scale 640x480 -> RGB -> Resize(240,320, antialias=true)",
+    "global": "1280x720 MJPEG -> scale 640x360 -> pad top/bottom 60px -> RGB -> Resize(240,320, antialias=true)",
+    "visual_aid_burned_in": false
+  }
+}
