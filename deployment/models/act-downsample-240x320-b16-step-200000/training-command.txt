@@ -1,0 +1,26 @@
+Training container image:
+swaaniida/lerobot:0.4.4-cu124
+
+Actual run command (inside the training container):
+STEPS=200000 BATCH_SIZE=16 NUM_WORKERS=4 OUT=/outputs/act-downsample-b16 JOB=act-downsample-b16 bash /workspace/train_act_downsample.sh
+
+Resolved training settings are preserved in pretrained_model/train_config.json. Key resolved values:
+dataset.repo_id=swaaniida/floor-1ball
+dataset.root=/datasets/floor-1ball
+dataset.video_backend=pyav
+dataset.image_transforms.enable=true
+dataset.image_transforms.max_num_transforms=1
+dataset.image_transforms.random_order=false
+dataset.image_transforms.tfs={"resize":{"weight":1.0,"type":"Resize","kwargs":{"size":[240,320],"antialias":true}}}
+policy.type=act
+policy.device=cuda
+policy.use_amp=true
+policy.input_features={"observation.images.local":{"type":"VISUAL","shape":[3,240,320]},"observation.images.global":{"type":"VISUAL","shape":[3,240,320]},"observation.state":{"type":"STATE","shape":[9]}}
+policy.chunk_size=100
+policy.n_action_steps=100
+batch_size=16
+num_workers=4
+steps=200000
+seed=1000
+save_checkpoint=true
+save_freq=10000

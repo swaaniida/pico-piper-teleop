@@ -1,0 +1,26 @@
+Training software (queried in swaaniida/lerobot:0.4.4-cu124):
+lerobot 0.4.4
+torch 2.6.0+cu124
+torchvision 0.21.0+cu124
+torch CUDA runtime 12.4
+
+Training image identity:
+local image ID sha256:5c53d50673fbc7f50d27189d3068d4f4426053602bac05d8cdc9e11d65e21442
+repository digest unavailable for this locally built image
+
+Eddy GPU/driver at publication:
+NVIDIA GeForce RTX 3090
+driver 550.163.01
+
+Deployment source repository:
+git rev-parse HEAD
+3b0e3daccbf65b342d51dd25a1f82bbbeee59b66
+
+git submodule status --recursive
+-c64ccf6acd577a333e03b66fafe8efeeceb511b1 src/XRoboToolkit-PC-Service-Pybind
+-c05c5454b1cf61c05ad26385e0c0a3aa6d3c7bad src/piper_sdk
+
+Dataset revision resolved from the Hugging Face cache ref used on Eddy:
+cf04444d8d3d8826842639c18200b410c3cd044b
+
+LeRobot was installed from the 0.4.4 PyPI wheel, so no LeRobot source Git checkout or commit was present in the training image.

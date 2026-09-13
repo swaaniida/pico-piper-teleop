@@ -1,0 +1,26 @@
+Training container image:
+swaaniida/lerobot:0.4.4-cu124
+
+Initial 0-to-100000 run (inside the training container):
+STEPS=100000 OUT=/outputs/act-absolute-baseline JOB=act-absolute-baseline RESUME=false bash /workspace/train_baseline.sh
+
+Selected checkpoint's 100000-to-200000 resume (inside the training container):
+STEPS=200000 RESUME=true OUT=/outputs/act-absolute-baseline JOB=act-absolute-baseline CONFIG_PATH=/outputs/act-absolute-baseline/checkpoints/100000/pretrained_model/train_config.json bash /workspace/train_baseline.sh
+
+Resolved training settings are preserved in pretrained_model/train_config.json. Key resolved values:
+dataset.repo_id=swaaniida/floor-1ball
+dataset.root=/datasets/floor-1ball
+dataset.video_backend=pyav
+dataset.image_transforms.enable=false
+policy.type=act
+policy.device=cuda
+policy.use_amp=true
+policy.input_features={"observation.images.local":{"type":"VISUAL","shape":[3,480,640]},"observation.images.global":{"type":"VISUAL","shape":[3,480,640]},"observation.state":{"type":"STATE","shape":[9]}}
+policy.chunk_size=100
+policy.n_action_steps=100
+batch_size=16
+num_workers=4
+steps=200000
+seed=1000
+save_checkpoint=true
+save_freq=10000
