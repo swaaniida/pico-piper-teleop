@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+WRIST_CAMERA="/dev/video10"
+GLOBAL_CAMERA="/dev/video11"
+USB_UUID="67EC-79D7"
+MIN_USB_FREE_BYTES=$((5 * 1024 * 1024 * 1024))
+
+set +u
+source /opt/ros/humble/setup.bash
+source "$HOME/tracer_ros2_ws/install/setup.bash"
+set -u
+
+for interface in piper_can tracer_can; do
+  [[ -r "/sys/class/net/$interface/operstate" ]] \
+    || { echo "ERROR: $interface is absent; run ./setup" >&2; exit 1; }
+  ip link show dev "$interface" | head -1 | grep -q '<[^>]*UP' \
+    || { echo "ERROR: $interface is DOWN; run ./setup" >&2; exit 1; }
+done
+
+# The Tracer controller can leave gs_usb ERROR-PASSIVE with a full TX queue
+# after a guarded session exit. Recover only this CAN interface here so the
+# next collection does not require the full ./setup sequence.
+tracer_can_state="$(
+  ip -details link show dev tracer_can \
+    | awk '/can state/ {print $3; exit}'
+)"
+if [[ "$tracer_can_state" != "ERROR-ACTIVE" ]]; then
+  echo "Recovering tracer_can from $tracer_can_state ..."
+  sudo -v
+  sudo ip link set tracer_can down
+  sudo ip link set tracer_can type can bitrate 500000
+  sudo ip link set tracer_can up
+  sleep 1
+  tracer_can_state="$(
+    ip -details link show dev tracer_can \
+      | awk '/can state/ {print $3; exit}'
+  )"
+  [[ "$tracer_can_state" == "ERROR-ACTIVE" ]] \
+    || { echo "ERROR: tracer_can remains $tracer_can_state; check Tracer power/CAN cable" >&2; exit 1; }
+  echo "tracer_can recovered."
+fi
+ss -lnt | grep -q ':60061 ' \
+  || { echo "ERROR: XRoboToolkit is not running; run ./setup" >&2; exit 1; }
+timeout 3 ros2 topic echo /tracer_status --once >/dev/null 2>&1 \
+  || { echo "ERROR: Tracer ROS feedback is absent; run ./setup" >&2; exit 1; }
+[[ -e "$WRIST_CAMERA" ]] \
+  || { echo "ERROR: wrist InnoMaker is absent at $WRIST_CAMERA; run ./setup" >&2; exit 1; }
+[[ -e "$GLOBAL_CAMERA" ]] \
+  || { echo "ERROR: global InnoMaker is absent at $GLOBAL_CAMERA; run ./setup" >&2; exit 1; }
+
+calibration_mode=false
+for argument in "$@"; do
+  if [[ "$argument" == "--calibrate-floor-init" || "$argument" == "--calibrate-drop-pose" ]]; then
+    calibration_mode=true
+  fi
+done
+
+if [[ "$calibration_mode" == false ]]; then
+  usb_device="/dev/disk/by-uuid/$USB_UUID"
+  [[ -e "$usb_device" ]] \
+    || { echo "ERROR: episode USB UUID $USB_UUID is absent" >&2; exit 1; }
+  usb_mount="$(lsblk -ndo MOUNTPOINTS "$usb_device" | head -n1)"
+  [[ -n "$usb_mount" && -d "$usb_mount" ]] \
+    || { echo "ERROR: episode USB is not mounted" >&2; exit 1; }
+  mountpoint -q "$usb_mount" \
+    || { echo "ERROR: invalid episode USB mount: $usb_mount" >&2; exit 1; }
+  mount_options="$(findmnt -rn --target "$usb_mount" -o OPTIONS)"
+  [[ ",$mount_options," == *,rw,* ]] \
+    || { echo "ERROR: episode USB is not writable: $mount_options" >&2; exit 1; }
+  available_bytes="$(df --output=avail -B1 "$usb_mount" | tail -n1 | tr -d ' ')"
+  (( available_bytes >= MIN_USB_FREE_BYTES )) \
+    || { echo "ERROR: episode USB has less than 5 GiB free" >&2; exit 1; }
+  export PIPER_EPISODES_DIR="$usb_mount/piper_tracer/episodes"
+  mkdir -p "$PIPER_EPISODES_DIR"
+  write_probe="$PIPER_EPISODES_DIR/.write_probe_$$"
+  printf x >"$write_probe"
+  rm -- "$write_probe"
+  echo "Episode storage: $PIPER_EPISODES_DIR"
+fi
+
+cd "$ROOT"
+exec "$HOME/miniconda3/envs/piper-xr/bin/python" -u \
+  -m single_piper_teleop.teleop --with-tracer \
+  --wrist-camera-device "$WRIST_CAMERA" \
+  --global-camera-device "$GLOBAL_CAMERA" \
+  "$@"

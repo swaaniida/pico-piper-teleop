@@ -12,12 +12,13 @@ COMMAND_TIMEOUT_S = 0.2
 PUBLISH_HZ = 50.0
 
 
-def _bridge_worker(command, status, stop_event, ready_event, errors) -> None:
+def _bridge_worker(command, status, odometry, stop_event, ready_event, errors) -> None:
     node = None
     publisher = None
     try:
         import rclpy
         from geometry_msgs.msg import Twist
+        from nav_msgs.msg import Odometry
         from rclpy.signals import SignalHandlerOptions
         from tracer_msgs.msg import TracerStatus
 
@@ -31,7 +32,20 @@ def _bridge_worker(command, status, stop_event, ready_event, errors) -> None:
                 status[1] = float(message.error_code)
                 status[2] = time.monotonic()
 
+        def odom_callback(message: Odometry) -> None:
+            with odometry.get_lock():
+                odometry[:] = [
+                    float(message.pose.pose.position.x),
+                    float(message.pose.pose.position.y),
+                    float(message.pose.pose.orientation.z),
+                    float(message.pose.pose.orientation.w),
+                    float(message.twist.twist.linear.x),
+                    float(message.twist.twist.angular.z),
+                    time.monotonic(),
+                ]
+
         node.create_subscription(TracerStatus, "/tracer_status", status_callback, 10)
+        node.create_subscription(Odometry, "/odom", odom_callback, 10)
         period = 1.0 / PUBLISH_HZ
         next_publish = time.monotonic()
         while not stop_event.is_set():
@@ -84,12 +98,16 @@ class TracerRosBridge:
         now = time.monotonic()
         self._command = context.Array("d", [0.0, 0.0, now], lock=True)
         self._status = context.Array("d", [-1.0, -1.0, 0.0, 0.0], lock=True)
+        self._odometry = context.Array("d", [0.0] * 7, lock=True)
         self._stop = context.Event()
         self._ready = context.Event()
         self._errors = context.Queue()
         self._process = context.Process(
             target=_bridge_worker,
-            args=(self._command, self._status, self._stop, self._ready, self._errors),
+            args=(
+                self._command, self._status, self._odometry,
+                self._stop, self._ready, self._errors,
+            ),
             name="tracer_ros_bridge",
         )
 
@@ -128,12 +146,25 @@ class TracerRosBridge:
     def snapshot(self) -> dict[str, Any]:
         with self._status.get_lock():
             vehicle, error, stamp, subscribers = self._status[:]
+        with self._odometry.get_lock():
+            odom_x, odom_y, odom_qz, odom_qw, linear, angular, odom_stamp = (
+                self._odometry[:]
+            )
         return {
             "vehicle": int(vehicle) if vehicle >= 0 else None,
             "error": int(error) if error >= 0 else None,
             "stamp": float(stamp),
             "cmd_vel_subscribers": int(subscribers),
             "bridge_alive": self._process.is_alive(),
+            "odometry": {
+                "x_m": float(odom_x),
+                "y_m": float(odom_y),
+                "orientation_z": float(odom_qz),
+                "orientation_w": float(odom_qw),
+                "linear_mps": float(linear),
+                "angular_rad_s": float(angular),
+                "stamp": float(odom_stamp),
+            } if odom_stamp > 0.0 else None,
         }
 
     def close(self) -> None:

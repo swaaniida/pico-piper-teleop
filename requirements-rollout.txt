@@ -1,0 +1,7 @@
+# Keep these versions identical to the two published ACT checkpoints.
+lerobot==0.4.4
+torch==2.6.0
+torchvision==0.21.0
+numpy==2.2.6
+opencv-python==4.12.0.88
+piper_sdk

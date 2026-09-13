@@ -1,0 +1,19 @@
+{
+  "selected_step": 200000,
+  "validation": {
+    "available": false,
+    "reason": "Training config has env=null; no validation or physical rollout metric was recorded."
+  },
+  "final_training_log": {
+    "timestamp_utc": "2026-09-12T08:58:37Z",
+    "loss": 0.025,
+    "gradient_norm": 1.576,
+    "learning_rate": 1e-05,
+    "update_seconds": 0.220,
+    "data_seconds": 0.083,
+    "wandb_project": "floor-1ball",
+    "wandb_run_id": "k3u1a1g4"
+  },
+  "selection_basis": "Latest explicit completed 200000-step artifact; not claimed as best because no validation or rollout comparison exists.",
+  "history_note": "The 100000-to-200000 resume was run more than once with the same W&B run ID. The current 200000 files correspond to the completed run ending at 2026-09-12T08:58:40Z. A later incomplete duplicate resume only advanced the last symlink to 150000 and did not replace the explicit 200000 directory."
+}

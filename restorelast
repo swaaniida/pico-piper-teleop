@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+USB_UUID="67EC-79D7"
+usb_device="/dev/disk/by-uuid/$USB_UUID"
+[[ -e "$usb_device" ]] || { echo "ERROR: episode USB is absent" >&2; exit 1; }
+usb_mount="$(lsblk -ndo MOUNTPOINTS "$usb_device" | head -n1)"
+[[ -n "$usb_mount" && -d "$usb_mount" ]] || { echo "ERROR: episode USB is not mounted" >&2; exit 1; }
+
+episodes="$usb_mount/piper_tracer/episodes"
+backup_root="$usb_mount/piper_tracer/.rmlast_backup"
+[[ -d "$backup_root" ]] || { echo "ERROR: no rmlast backup" >&2; exit 1; }
+backup="$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -E '^20[0-9]{6}_[0-9]{6}(_[0-9]{2})?$' | sort | tail -n1 || true)"
+[[ -n "$backup" ]] || { echo "ERROR: no rmlast backup" >&2; exit 1; }
+
+source_path="$backup_root/$backup"
+destination="$episodes/$backup"
+[[ "$source_path" == "$backup_root"/20??????_??????* && -d "$source_path" ]] || { echo "ERROR: refusing unexpected restore source" >&2; exit 1; }
+[[ ! -e "$destination" ]] || { echo "ERROR: episode already exists: $destination" >&2; exit 1; }
+mkdir -p "$episodes"
+mv -- "$source_path" "$destination"
+
+echo "Restored: $backup"
+echo "Collection order restored; next ./start continues after this episode."

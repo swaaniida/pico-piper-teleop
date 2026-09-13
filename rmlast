@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+USB_UUID="67EC-79D7"
+usb_device="/dev/disk/by-uuid/$USB_UUID"
+[[ -e "$usb_device" ]] || { echo "ERROR: episode USB is absent" >&2; exit 1; }
+
+usb_mount="$(lsblk -ndo MOUNTPOINTS "$usb_device" | head -n1)"
+[[ -n "$usb_mount" && -d "$usb_mount" ]] \
+  || { echo "ERROR: episode USB is not mounted" >&2; exit 1; }
+
+episodes="$usb_mount/piper_tracer/episodes"
+[[ -d "$episodes" ]] || { echo "ERROR: episode folder is absent" >&2; exit 1; }
+
+latest="$(
+  find "$episodes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+    | grep -E '^20[0-9]{6}_[0-9]{6}(_[0-9]{2})?$' \
+    | sort \
+    | tail -n1 \
+    || true
+)"
+[[ -n "$latest" ]] || { echo "ERROR: no episode to remove" >&2; exit 1; }
+
+target="$episodes/$latest"
+[[ "$target" == "$episodes"/20??????_??????* && -d "$target" ]] \
+  || { echo "ERROR: refusing unexpected delete target: $target" >&2; exit 1; }
+backup_root="$usb_mount/piper_tracer/.rmlast_backup"
+mkdir -p "$backup_root"
+old_backup="$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -E '^20[0-9]{6}_[0-9]{6}(_[0-9]{2})?$' | sort | tail -n1 || true)"
+if [[ -n "$old_backup" ]]; then
+  old_target="$backup_root/$old_backup"
+  [[ "$old_target" == "$backup_root"/20??????_??????* && -d "$old_target" ]] \
+    || { echo "ERROR: refusing unexpected backup target: $old_target" >&2; exit 1; }
+  rm -r -- "$old_target"
+fi
+mv -- "$target" "$backup_root/$latest"
+
+echo "Removed: $latest"
+echo "Next ./start repeats this collection position."
+echo "Undo: ./restorelast"

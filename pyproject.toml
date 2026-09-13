@@ -11,7 +11,7 @@ dependencies = [
   "numpy==2.2.6",
   "scipy==1.15.3",
   "placo==0.9.23",
-  "opencv-python-headless==5.0.0.93",
+  "opencv-python==4.12.0.88",
 ]
 
 [project.scripts]
@@ -20,6 +20,7 @@ piper-validate = "single_piper_teleop.validate:main"
 piper-recover = "single_piper_teleop.recover:main"
 piper-preflight = "single_piper_teleop.preflight:main"
 tracer-teleop = "tracer_mini.pico_teleop:main"
+piper-rollout-shadow = "single_piper_rollout.cli:main"
 
 [tool.setuptools]
-packages = ["single_piper_teleop", "tracer_mini"]
+packages = ["single_piper_teleop", "single_piper_rollout", "tracer_mini"]

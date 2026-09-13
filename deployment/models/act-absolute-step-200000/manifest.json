@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "model_id": "act-absolute-step-200000",
+  "release": {
+    "tag": "floor-1ball-act-absolute-step-200000",
+    "asset": "floor-1ball-act-absolute-step-200000.tar.zst",
+    "asset_sha256": "ca0321346e4259be32c9d7eafe57826462601f497f56738b8a113799ff7acaa0"
+  },
+  "policy_type": "act",
+  "source_git_commit": "3b0e3daccbf65b342d51dd25a1f82bbbeee59b66",
+  "training_dataset": {
+    "repo_id": "swaaniida/floor-1ball",
+    "revision": "cf04444d8d3d8826842639c18200b410c3cd044b",
+    "episodes": 49,
+    "fps": 50
+  },
+  "software": {
+    "lerobot_version": "0.4.4",
+    "torch_version": "2.6.0+cu124",
+    "torchvision_version": "0.21.0+cu124",
+    "cuda_runtime": "12.4",
+    "training_container_digest": "sha256:5c53d50673fbc7f50d27189d3068d4f4426053602bac05d8cdc9e11d65e21442"
+  },
+  "features": {
+    "image_keys": [
+      "observation.images.local",
+      "observation.images.global"
+    ],
+    "image_shape_hwc": [480, 640, 3],
+    "policy_input_shape_chw": [3, 480, 640],
+    "state_key": "observation.state",
+    "state_names": [
+      "joint_1_rad",
+      "joint_2_rad",
+      "joint_3_rad",
+      "joint_4_rad",
+      "joint_5_rad",
+      "joint_6_rad",
+      "gripper_mm",
+      "base_linear_mps",
+      "base_angular_rad_s"
+    ],
+    "action_key": "action",
+    "action_names": [
+      "joint_1_rad",
+      "joint_2_rad",
+      "joint_3_rad",
+      "joint_4_rad",
+      "joint_5_rad",
+      "joint_6_rad",
+      "gripper_mm",
+      "base_linear_mps",
+      "base_angular_rad_s"
+    ]
+  },
+  "action_representation": "absolute",
+  "chunk_size": 100,
+  "n_action_steps": 100,
+  "temporal_ensemble_coeff": null,
+  "checkpoint": {
+    "selected_step": 200000,
+    "selection_reason": "Final requested step from a completed 100000-to-200000 resume; no validation environment or rollout metric was available. The explicit 200000 directory is used because the run's last symlink was later moved to 150000 by an incomplete duplicate resume.",
+    "pretrained_model_directory": "pretrained_model",
+    "source_path_on_eddy": "/media/moai/data2/swaaniida/floor-1ball/outputs/act-absolute-baseline/checkpoints/200000/pretrained_model",
+    "source_size_bytes": 206763008
+  },
+  "training_image_transforms": {
+    "enable": false
+  },
+  "camera_preprocessing": {
+    "local": "1280x720 MJPEG -> scale 640x480 -> RGB",
+    "global": "1280x720 MJPEG -> scale 640x360 -> pad top/bottom 60px -> RGB",
+    "visual_aid_burned_in": false
+  }
+}

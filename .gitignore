@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .venv/
+.runtime/
+*.egg-info/
 
 # Hardware recordings and generated episode data
 data/
@@ -14,5 +16,14 @@ logs/
 scripts/
 config/*
 !config/*.link
+!config/floor_pick_init.json
+!config/cup_drop_pose.json
 AGENTS.md
-docs/
+
+# Model binaries are distributed as verified GitHub Release assets, not commits.
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.tar.zst

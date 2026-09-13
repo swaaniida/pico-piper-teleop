@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "model_id": "act-absolute-step-100000",
+  "policy_type": "act",
+  "source_git_commit": "REQUIRED_FULL_GIT_SHA",
+  "training_dataset": {
+    "repo_id": "swaaniida/floor-1ball",
+    "revision": "REQUIRED_DATASET_GIT_SHA",
+    "episodes": 49,
+    "fps": 50
+  },
+  "software": {
+    "lerobot_version": "REQUIRED",
+    "torch_version": "REQUIRED",
+    "torchvision_version": "REQUIRED",
+    "cuda_runtime": "REQUIRED",
+    "training_container_digest": "REQUIRED"
+  },
+  "features": {
+    "image_keys": [
+      "observation.images.local",
+      "observation.images.global"
+    ],
+    "image_shape_hwc": [480, 640, 3],
+    "state_key": "observation.state",
+    "state_names": [
+      "joint_1_rad",
+      "joint_2_rad",
+      "joint_3_rad",
+      "joint_4_rad",
+      "joint_5_rad",
+      "joint_6_rad",
+      "gripper_mm",
+      "base_linear_mps",
+      "base_angular_rad_s"
+    ],
+    "action_key": "action",
+    "action_names": [
+      "joint_1_rad",
+      "joint_2_rad",
+      "joint_3_rad",
+      "joint_4_rad",
+      "joint_5_rad",
+      "joint_6_rad",
+      "gripper_mm",
+      "base_linear_mps",
+      "base_angular_rad_s"
+    ]
+  },
+  "action_representation": "absolute",
+  "chunk_size": 100,
+  "n_action_steps": 100,
+  "temporal_ensemble_coeff": null,
+  "checkpoint": {
+    "selected_step": 100000,
+    "selection_reason": "REQUIRED",
+    "pretrained_model_directory": "pretrained_model"
+  },
+  "camera_preprocessing": {
+    "local": "1280x720 MJPEG -> scale 640x480 -> RGB",
+    "global": "1280x720 MJPEG -> scale 640x360 -> pad top/bottom 60px -> RGB",
+    "visual_aid_burned_in": false
+  }
+}

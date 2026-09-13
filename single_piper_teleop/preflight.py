@@ -20,6 +20,7 @@ def check_import(name: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--software-only", action="store_true")
+    parser.add_argument("--camera-device", default="")
     args = parser.parse_args()
 
     for module in ("numpy", "scipy", "placo", "cv2", "piper_sdk", "xrobotoolkit_sdk"):
@@ -52,7 +53,7 @@ def main() -> None:
     import cv2
     from .wrist_camera import find_innomaker_device
 
-    device = find_innomaker_device()
+    device = args.camera_device or find_innomaker_device()
     capture = cv2.VideoCapture(device, cv2.CAP_V4L2)
     ok, frame = capture.read() if capture.isOpened() else (False, None)
     capture.release()

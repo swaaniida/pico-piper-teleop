@@ -95,6 +95,7 @@ def validate(episode: Path) -> dict[str, Any]:
     non_normal = 0
     tracer_errors = 0
     tracer_estops = 0
+    tracer_odom_samples = 0
     # Commands are written after the feedback in the same sample. Compare each
     # active command with feedback at least 100ms later instead of pre-command feedback.
     future_index = 0
@@ -118,6 +119,7 @@ def validate(episode: Path) -> dict[str, Any]:
         if tracer:
             tracer_errors += int(tracer.get("error", 0) != 0)
             tracer_estops += int(tracer.get("vehicle", 0) != 0)
+            tracer_odom_samples += int(tracer.get("odometry") is not None)
 
     wrist_has_depth = bool(
         metadata.get(
@@ -138,8 +140,22 @@ def validate(episode: Path) -> dict[str, Any]:
         reasons.append("episode metadata missing")
     elif metadata.get("status") != "complete":
         reasons.append(f"episode status is {metadata.get('status')}")
-    elif not metadata.get("dry_run", False) and not metadata.get("returned_to_episode_home", False):
-        reasons.append("episode did not confirm return to its init pose")
+    elif not metadata.get("dry_run", False):
+        event_names = [event.get("name") for event in metadata.get("events", [])]
+        if event_names:
+            required_events = ["place_complete", "return_complete"]
+            if int(metadata.get("workflow_version", 1)) >= 2:
+                required_events.insert(0, "pick_complete")
+            if int(metadata.get("workflow_version", 1)) >= 3:
+                required_events.insert(0, "locomotion_complete")
+            if any(name not in event_names for name in required_events):
+                reasons.append("episode is missing required phase events")
+            elif [event_names.index(name) for name in required_events] != sorted(
+                event_names.index(name) for name in required_events
+            ):
+                reasons.append("episode phase events are out of order")
+        elif not metadata.get("returned_to_episode_home", False):
+            reasons.append("episode has neither phase events nor a confirmed legacy return")
     if malformed:
         reasons.append(f"{malformed} malformed JSON lines")
     if non_monotonic_pc:
@@ -148,6 +164,15 @@ def validate(episode: Path) -> dict[str, Any]:
         reasons.append(f"robot status failures: errors={status_errors}, non_normal={non_normal}")
     if tracer_errors or tracer_estops:
         reasons.append(f"tracer status failures: errors={tracer_errors}, estop={tracer_estops}")
+    if (
+        metadata
+        and metadata.get("learning_schema_version", 0) >= 1
+        and metadata.get("tracer_enabled", False)
+        and tracer_odom_samples / len(samples) < 0.90
+    ):
+        reasons.append(
+            f"Tracer odometry missing in {len(samples) - tracer_odom_samples}/{len(samples)} samples"
+        )
     if wrist_camera["missing_files"]:
         reasons.append(f"{wrist_camera['missing_files']} wrist camera files missing")
     if global_camera["missing_files"]:
@@ -192,6 +217,7 @@ def validate(episode: Path) -> dict[str, Any]:
         "tracer": {
             "error_samples": tracer_errors,
             "estop_samples": tracer_estops,
+            "odometry_samples": tracer_odom_samples,
         },
         "camera": wrist_camera,
         "wrist_camera": wrist_camera,

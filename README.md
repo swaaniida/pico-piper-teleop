@@ -2,6 +2,61 @@
 
 오른쪽 PICO 컨트롤러로 PiPER를, 왼쪽 컨트롤러로 Tracer Mini를 조작한다.
 손목 InnoMaker RGB 영상과 로봇/XR 데이터를 같은 episode에 저장한다.
+새 InnoMaker U20CAM을 global camera로 함께 사용한다.
+
+완전 초기 준비와 수집 시작은 각각 한 명령으로 실행한다.
+
+```bash
+./setup
+./start
+```
+
+방금 저장한 episode를 수집 목록에서 제거하려면 `./rmlast`를 실행한다.
+가장 최근 삭제본 하나는 USB에 백업되며, 다음 `./start`는 제거된 episode와
+동일한 수집 위치부터 다시 시작한다. 잘못 제거했다면 `./restorelast`로 실제
+데이터와 수집 순서를 함께 복구한다.
+
+`start`는 이전 종료 뒤 `tracer_can`이 `ERROR-PASSIVE`로 남아 있으면 해당 CAN만
+자동으로 down/up 복구한다. 이 경우에만 sudo 암호를 요구하며 전체 `setup`을 다시
+실행할 필요가 없다. 복구 후에도 `ERROR-ACTIVE`가 아니면 Tracer 전원과 CAN 케이블을
+확인하도록 실행을 중단한다.
+
+일반 `./start`는 UUID `67EC-79D7`의 episode USB가 정상 마운트되고 쓰기 가능하며
+5 GiB 이상 남아 있을 때만 실행된다. 새 데이터는 USB의
+`piper_tracer/episodes/<episode-id>`에 직접 기록한다. USB가 없거나 읽기 전용으로
+바뀌면 내부 디스크로 조용히 대체하지 않고 실행을 중단한다. init 보정은 데이터를
+기록하지 않으므로 USB 검사를 생략한다.
+
+바닥 집기용 init 자세는 다음 보정 명령으로 저장한다. 기존 init으로 안전하게
+진입한 뒤 오른쪽 grip을 잡고 자세를 조정한다. 보정 중에는 J2·J3·J5만 움직이며
+J1·J4·J6과 그리퍼 개폐값은 진입 순간 값으로 고정되고 Tracer 명령도 차단된다. grip을 놓고 A를 누르면
+`config/floor_pick_init.json`에 현재 실측 관절값이 저장되며, 이후 `./start`의
+A2 단계가 이 자세를 manipulation init으로 사용한다. 시작 자세는 기존 locomotion
+init을 유지한다. B는 기존과 동일한 안전 종료이다.
+
+```bash
+./calibrate-init
+```
+
+Tracer 좌측 파란 컵 위의 공 놓기 직전 자세는 다음 명령으로 지정한다. 기존
+locomotion init에서 시작하며 Tracer는 잠긴다. 오른쪽 grip으로 EE pose를 맞춘 뒤
+grip을 놓고 A를 누르면 관절값과 link6 위치·quaternion·transform이
+`config/cup_drop_pose.json`에 저장된다. 저장된 EE pose를 확인한 뒤 안전한 상향
+이격·컵 상부 접근 waypoint를 생성해 episode 상태 머신에 적용한다.
+
+```bash
+./calibrate-drop
+```
+
+Global 화면의 녹색 반원은 locomotion 정지용 aid이다. 기존 박스의 가로 폭을
+지름으로 하는 위쪽 반원이며, 중심선은 조금 아래로 배치한다. 화면에만 표시되고
+원본 학습 이미지에는 기록되지 않는다.
+비기록 공 세팅 단계에서는 높이 35.5cm, 수평 기준 하향 60°, U20CAM 수평 FOV
+106°의 투영 모델로 다음 공 위치를 자홍색 점으로 표시한다. 시야 밖 목표는 화면
+경계에 `OUT`으로 표시한다. 이 점 역시 미리보기에만 표시된다.
+100회 수집 계획의 공 거리는 `45·50·60·65·70cm`, 좌우 위치는
+`-20·-10·0·10·20cm`이다. 중앙 D70은 도달했던 episode 2를 유지하면서,
+도달하지 못한 기존 R30/D75 결합 극단을 R20/D70 안쪽으로 축소했다.
 
 ## 조작
 
@@ -9,10 +64,27 @@
 - 오른쪽 trigger: 그리퍼
 - 왼쪽 grip + 왼쪽 stick: Tracer 전진/후진
 - 왼쪽 grip + 오른쪽 stick: Tracer 회전
-- A 버튼 또는 터미널 Enter: episode 시작/ZIP init 복귀 후 종료
-- B 버튼: 즉시 전체 정지 후 ZIP start 자세 복귀, 도착 확인 뒤 토크 해제 및 프로그램 종료
-- X 버튼: Tracer 범퍼 E-stop 해제
-- Ctrl-C: ZIP start 복귀 후 토크 해제
+- 프로그램을 처음 켠 `SET BALL` 단계에서도 왼쪽 grip+stick으로 Tracer를 배치할 수 있으며 PiPER는 잠겨 있다.
+- A1: 기존 locomotion init에서 episode 녹화 시작 (`locomotion`)
+- A2: 공이 Global aid에 들어오면 locomotion 완료 기록 후 manipulation init 진입
+- A3: 공 집기 완료 기록 후 locomotion init → 컵 상부 경유점 → 투하 자세 → 그리퍼 자동 개방과 동시에 cup clearance로 상승 → locomotion init 복귀 → episode 저장 종료
+- A2/A3의 모든 자동 trajectory도 50 Hz로 실측 state, commanded action, 카메라 참조를 기록하며 `control_source=automatic`과 세부 subphase를 저장
+- 각 sample은 PiPER 관절·그리퍼 실측값, absolute 관절·그리퍼 명령, Tracer `cmd_vel`과 `/odom`, local/global 원본 프레임 참조를 함께 저장한다. 원본은 변환하지 않으며 학습 시 동일 episode에서 absolute, stepwise delta, chunkwise delta action을 파생한다.
+- 카메라는 캡처/JPEG 인코딩과 USB 쓰기를 분리한 10초 RAM queue를 사용하고, `samples.jsonl`도 별도 비동기 writer가 기록한다. queue 초과나 쓰기 실패는 프레임을 조용히 버리지 않고 episode 오류로 처리하며, 정상 종료는 모든 queue drain과 JSONL `fsync` 이후에만 확정한다.
+- 첫 학습 baseline은 Mobile ALOHA ACT와 같이 phase/progress auxiliary head 없이 두 카메라와 proprioception에서 whole-body absolute action chunk를 예측한다. `episode_phase`, `control_source`, `trajectory_subphase`는 분석·구간별 평가용 metadata이며 baseline 입력이나 출력으로 사용하지 않는다.
+- A3 이후: 비기록 상태에서 joystick으로 공과 Tracer를 원위치로 초기화
+- 초기화 후 A1: PiPER init 복귀·도착 확인 후 다음 episode 녹화 시작
+- 프로그램 시작 직후와 A3 종료 뒤에도 카메라 미리보기를 유지하며, 다음 공 위치 안내를 보고 세팅한 후 A1으로 녹화를 시작
+- A2 manipulation init 및 A3/다음 A1의 locomotion init 복귀: 관절 최대 `25°/s`, 속도 제한 50%로 50 Hz 보간
+- B 버튼: 즉시 전체 정지지·카메라 기록 중단 후 USB queue 정리를 기다리지 않고 ZIP start 복귀, 토크 해제 뒤 미완성 episode 정리 및 프로그램 종료
+- X 버튼: 사용하지 않음. 잘못 저장한 최근 episode는 프로그램 종료 후 `./rmlast`로 제거
+- Y 버튼: Tracer 범퍼 E-stop 해제
+- 오른쪽 조이스틱 클릭: PICO 표시를 local/global camera로 전환
+- episode 녹화 중 local/global InnoMaker 영상을 함께 표시
+- A3 이후 수동 원상복구 중에도 미리보기는 유지하고 REC 표시와 프레임 저장만 중지
+- 미리보기 상단에 현재 단계와 다음 A 입력을 짧게 표시
+- 미리보기 창의 Q 또는 Esc: 안전 종료 요청
+- Ctrl-C: B와 동일하게 즉시 hold → ZIP start 복귀 → 토크 해제 → 종료
 
 PiPER는 grip을 잡은 순간을 기준으로 오른손의 위치와 손목 회전을 함께 추종한다.
 
@@ -181,14 +253,15 @@ cd ~/piper_teleop
 
 연결되면 참조 ZIP과 같이 `start → init` 순서로 이동하고 init 자세에서 대기한다.
 두 자세는 각각 `[-0.51, 0.49, 0.00, 3.96, 4.83, -8.33]°`,
-`[-1.86, 23.84, -60.0, 1.60, 50.65, 0.0]°`이다.
+`[-1.0, 23.84, -60.0, 0.0, 50.65, -1.5]°`이다.
 원본 ZIP의 start J3 `+1.60°`는 이 PiPER에서 `0°` 경계에 걸리므로,
 실측 도달 자세인 `0°`를 사용한다.
 
 ```text
-A: episode 시작
-A: init 복귀 확인 → episode 저장 종료
-A: 다음 episode 시작
+A1: episode 시작 → locomotion
+A2: locomotion_complete 기록 → manipulation init → manipulation
+A3: pick_complete 기록 → locomotion init → 컵 상부 안전점 → 투하 자세 → 자동 개방과 동시에 안전점으로 상승 → locomotion init → episode 저장 종료
+비기록 수동 초기화 후 A1: PiPER init 복귀 확인 → 다음 episode 시작
 B: 즉시 hold → start 복귀 확인 → STANDBY → 토크 해제 → 프로그램 종료
 ```
 
@@ -224,13 +297,11 @@ data/episodes/<episode-id>/
 - PiPER 관절, gripper, end pose, 상태, error, enable
 - Tracer 속도 명령, 상태, E-stop 상태
 - 손목 InnoMaker RGB 경로, frame number, PC monotonic/wall timestamp
-- 고정 Logitech C920 RGB 경로, frame number, PC monotonic/wall timestamp
+- global InnoMaker RGB 경로, frame number, PC monotonic/wall timestamp
 
-에피소드 시작 시 손목 InnoMaker U20CAM과 global Logitech C920가 함께 기록된다.
-두 카메라는 USB serial 기반 `/dev/v4l/by-id` 경로로 구분한다. 손목 카메라는 기본
-`640x480`, `30 Hz`, JPEG이며 depth는 기록하지 않는다. Logitech은 기본 `1280x720`,
-`15 Hz`, JPEG이다. global 카메라를 의도적으로 제외할 때만 실행 명령에
-`--no-global-camera`를 붙인다.
+에피소드 시작 시 손목과 global InnoMaker U20CAM을 함께 기록한다. 두 장치가 모두
+동일한 `SN0001` serial을 제공하므로 USB 물리 포트 기반 `/dev/v4l/by-path`로
+구분한다. 손목은 USB `3.4.4`, global은 USB `3.3` 포트에 고정한다.
 
 최근 에피소드 검증:
 
@@ -266,6 +337,24 @@ episode=$(find data/episodes -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
 - firmware, zero, joint limit, CAN offset, installation pose, master/slave 설정 변경 금지
 - 오류 또는 피드백 정지 시 새 목표 전송 금지
 - 실제 동작은 작은 범위부터 확인
+
+## 학습 checkpoint와 추론 PC
+
+Eddy의 checkpoint binary는 Git commit이 아니라 GitHub Release에 있다. 현재 모델은
+`deployment/models/`의 manifest가 source of truth다. 추론 PC에서는 아래처럼 모델을
+직접 받고, 실제 명령을 전혀 보내지 않는 shadow 검증부터 수행한다.
+
+```bash
+python3 tools/fetch_rollout_model.py act-downsample-240x320-b16-step-200000
+./rollout-shadow \
+  checkpoints/act-downsample-240x320-b16-step-200000/\
+floor-1ball-act-downsample-240x320-b16-step-200000 \
+  --seconds 30
+```
+
+전체 계약, exact version, checksum, 단계별 live 승인 조건은
+`docs/INFERENCE_ROLLOUT.md`를 따른다. 현재 `rollout-shadow`에는 의도적으로 actuator
+송신 코드가 없다.
 
 ## VM 삭제 전 확인
 

@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_DIR="$ROOT/.runtime"
+XR_DIR="/opt/apps/roboticsservice"
+XR_LOG="$RUNTIME_DIR/xrobotics.log"
+TRACER_LOG="$RUNTIME_DIR/tracer_base.log"
+TRACER_PID_FILE="$RUNTIME_DIR/tracer_base.pid"
+PICO_VIDEO_PID_FILE="$RUNTIME_DIR/pico_h264_sender.pid"
+CAMERA_FANOUT_PID_FILE="$RUNTIME_DIR/camera_fanout.pid"
+CAMERA_FANOUT_LOG="$RUNTIME_DIR/camera_fanout.log"
+GLOBAL_FANOUT_PID_FILE="$RUNTIME_DIR/global_fanout.pid"
+GLOBAL_FANOUT_LOG="$RUNTIME_DIR/global_fanout.log"
+PHYSICAL_WRIST_CAMERA="/dev/v4l/by-path/pci-0000:04:00.3-usb-0:2.4.4:1.0-video-index0"
+SHARED_WRIST_CAMERA="/dev/video10"
+SHARED_GLOBAL_CAMERA="/dev/video11"
+PC_IP=""
+EXPECTED_WIFI="MoAI_LAB_5G"
+EXPECTED_PC_IP="192.168.0.83"
+WRIST_CAMERA="$PHYSICAL_WRIST_CAMERA"
+GLOBAL_CAMERA="/dev/v4l/by-path/pci-0000:04:00.3-usb-0:2.3:1.0-video-index0"
+
+mkdir -p "$RUNTIME_DIR"
+
+echo "[1/6] Detecting the active Wi-Fi address ..."
+wifi_connection="$(nmcli -t -f NAME,TYPE,DEVICE connection show --active \
+  | awk -F: '$2 == "802-11-wireless" && $3 != "" {print $1; exit}')"
+if [[ -z "$wifi_connection" ]]; then
+  echo "ERROR: no active Wi-Fi connection" >&2
+  exit 1
+fi
+if [[ "$wifi_connection" != "$EXPECTED_WIFI" ]]; then
+  echo "ERROR: connect Wi-Fi '$EXPECTED_WIFI' first (active: $wifi_connection)" >&2
+  exit 1
+fi
+wifi_device="$(nmcli -t -f NAME,TYPE,DEVICE connection show --active \
+  | awk -F: '$2 == "802-11-wireless" && $3 != "" {print $3; exit}')"
+PC_IP="$(ip -4 -o address show dev "$wifi_device" scope global \
+  | awk '{split($4, a, "/"); print a[1]; exit}')"
+if [[ -z "$PC_IP" ]]; then
+  echo "ERROR: active Wi-Fi has no IPv4 address" >&2
+  exit 1
+fi
+if [[ "$PC_IP" != "$EXPECTED_PC_IP" ]]; then
+  echo "ERROR: Wi-Fi IPv4 must be $EXPECTED_PC_IP (current: $PC_IP)" >&2
+  exit 1
+fi
+echo "      PICO server address: $PC_IP:63901"
+
+echo "[2/6] Configuring SocketCAN (sudo may ask once) ..."
+sudo -v
+for interface in piper_can tracer_can; do
+  [[ -e "/sys/class/net/$interface" ]] || {
+    echo "ERROR: $interface is absent; reconnect its USB-CAN adapter" >&2
+    exit 1
+  }
+done
+sudo ip link set piper_can down 2>/dev/null || true
+sudo ip link set piper_can type can bitrate 1000000
+sudo ip link set piper_can up
+sudo ip link set tracer_can down 2>/dev/null || true
+sudo ip link set tracer_can type can bitrate 500000
+sudo ip link set tracer_can up
+
+echo "      Sharing wrist camera with teleoperation and PICO ..."
+for camera_path in "$WRIST_CAMERA" "$GLOBAL_CAMERA"; do
+  [[ -e "$camera_path" ]] || {
+    echo "ERROR: physical camera is absent: $camera_path" >&2
+    exit 1
+  }
+done
+for pid_file in "$PICO_VIDEO_PID_FILE" "$CAMERA_FANOUT_PID_FILE" "$GLOBAL_FANOUT_PID_FILE"; do
+  if [[ -f "$pid_file" ]]; then
+    old_pid="$(<"$pid_file")"
+    if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill -TERM "$old_pid" 2>/dev/null || true
+      sleep 0.5
+    fi
+  fi
+done
+sudo modprobe -r v4l2loopback 2>/dev/null || true
+sudo modprobe v4l2loopback video_nr=10,11 \
+  card_label=PiperSharedWrist,PiperSharedGlobal exclusive_caps=1,1
+setsid ffmpeg -hide_banner -loglevel warning -fflags nobuffer \
+  -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 \
+  -i "$PHYSICAL_WRIST_CAMERA" -vf scale=640:480 -pix_fmt yuyv422 \
+  -f v4l2 "$SHARED_WRIST_CAMERA" >"$CAMERA_FANOUT_LOG" 2>&1 </dev/null &
+echo $! >"$CAMERA_FANOUT_PID_FILE"
+setsid ffmpeg -hide_banner -loglevel warning -fflags nobuffer \
+  -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 \
+  -i "$GLOBAL_CAMERA" \
+  -vf 'scale=640:360,pad=640:480:0:60:black' -pix_fmt yuyv422 \
+  -f v4l2 "$SHARED_GLOBAL_CAMERA" >"$GLOBAL_FANOUT_LOG" 2>&1 </dev/null &
+echo $! >"$GLOBAL_FANOUT_PID_FILE"
+for _ in {1..30}; do
+  wrist_pid="$(<"$CAMERA_FANOUT_PID_FILE")"
+  global_pid="$(<"$GLOBAL_FANOUT_PID_FILE")"
+  if kill -0 "$wrist_pid" 2>/dev/null \
+      && kill -0 "$global_pid" 2>/dev/null \
+      && [[ -e "$SHARED_WRIST_CAMERA" && -e "$SHARED_GLOBAL_CAMERA" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+kill -0 "$(<"$CAMERA_FANOUT_PID_FILE")" 2>/dev/null \
+  || { echo "ERROR: wrist camera fanout failed; see $CAMERA_FANOUT_LOG" >&2; exit 1; }
+kill -0 "$(<"$GLOBAL_FANOUT_PID_FILE")" 2>/dev/null \
+  || { echo "ERROR: global camera fanout failed; see $GLOBAL_FANOUT_LOG" >&2; exit 1; }
+setsid "$HOME/miniconda3/envs/piper-xr/bin/python" -u "$ROOT/tools/pico_h264_sender.py" \
+  --pico 192.168.0.229 --device "$SHARED_WRIST_CAMERA" \
+  --alternate-device "$SHARED_GLOBAL_CAMERA" \
+  --toggle-port 12346 \
+  --input-format yuyv422 --width 640 --height 480 \
+  >"$RUNTIME_DIR/pico_h264_sender.log" 2>&1 </dev/null &
+echo $! >"$PICO_VIDEO_PID_FILE"
+
+echo "[3/6] Restarting XRoboToolkit service ..."
+mapfile -t xr_pids < <(ps -C RoboticsServiceProcess -o pid= | awk '{print $1}')
+if ((${#xr_pids[@]})); then
+  kill -TERM "${xr_pids[@]}" 2>/dev/null || true
+  sleep 1
+fi
+(
+  cd "$XR_DIR"
+  export LD_LIBRARY_PATH="$XR_DIR:$XR_DIR/lib:$XR_DIR/SDK/x64"
+  setsid ./RoboticsServiceProcess >"$XR_LOG" 2>&1 </dev/null &
+)
+
+echo "[4/6] Starting the Tracer ROS node ..."
+set +u
+source /opt/ros/humble/setup.bash
+source "$HOME/tracer_ros2_ws/install/setup.bash"
+set -u
+if [[ -f "$TRACER_PID_FILE" ]]; then
+  old_pid="$(<"$TRACER_PID_FILE")"
+  if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+    kill -TERM "$old_pid" 2>/dev/null || true
+    sleep 1
+  fi
+fi
+# Remove a stale launch/node left by an older manual run, using exact executable names.
+mapfile -t stale_pids < <(ps -eo pid=,comm= | awk '$2 == "tracer_base_node" {print $1}')
+if ((${#stale_pids[@]})); then
+  kill -TERM "${stale_pids[@]}" 2>/dev/null || true
+  sleep 1
+fi
+setsid ros2 launch tracer_base tracer_mini_base.launch.py \
+  port_name:=tracer_can >"$TRACER_LOG" 2>&1 </dev/null &
+tracer_pid=$!
+echo "$tracer_pid" >"$TRACER_PID_FILE"
+
+echo "[5/6] Waiting for services and feedback ..."
+for _ in {1..30}; do
+  if ss -lnt | grep -q ':60061 ' \
+      && ss -lnt | grep -q ':63901 ' \
+      && timeout 1 ros2 topic echo /tracer_status --once >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+ss -lnt | grep -q ':60061 ' || { echo "ERROR: XR SDK port 60061 is absent" >&2; exit 1; }
+ss -lnt | grep -q ':63901 ' || { echo "ERROR: PICO port 63901 is absent" >&2; exit 1; }
+timeout 3 ros2 topic echo /tracer_status --once >/dev/null 2>&1 \
+  || { echo "ERROR: Tracer feedback is absent; see $TRACER_LOG" >&2; exit 1; }
+timeout 2 candump piper_can -n 1 >/dev/null 2>&1 \
+  || { echo "ERROR: PiPER CAN feedback is absent" >&2; exit 1; }
+
+echo "[6/6] Running software/InnoMaker camera preflight ..."
+cd "$ROOT"
+[[ -e "$WRIST_CAMERA" ]] \
+  || { echo "ERROR: wrist InnoMaker is absent at $WRIST_CAMERA" >&2; exit 1; }
+[[ -e "$GLOBAL_CAMERA" ]] \
+  || { echo "ERROR: global InnoMaker is absent at $GLOBAL_CAMERA" >&2; exit 1; }
+"$HOME/miniconda3/envs/piper-xr/bin/python" -m single_piper_teleop.preflight \
+  --camera-device "$SHARED_WRIST_CAMERA"
+
+echo
+echo "READY"
+echo "PICO: $PC_IP:63901 -> working"
+echo "Then run: ./start"

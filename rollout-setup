@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Inference-only setup: CAN, Tracer ROS and camera fanouts. No XR/PICO.
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME="$ROOT/.runtime/rollout"
+LOCAL_PHYSICAL="${PIPER_LOCAL_CAMERA:-/dev/v4l/by-path/pci-0000:04:00.3-usb-0:2.4.4:1.0-video-index0}"
+GLOBAL_PHYSICAL="${PIPER_GLOBAL_CAMERA:-/dev/v4l/by-path/pci-0000:04:00.3-usb-0:2.3:1.0-video-index0}"
+LOCAL_SHARED="${PIPER_LOCAL_SHARED:-/dev/video10}"
+GLOBAL_SHARED="${PIPER_GLOBAL_SHARED:-/dev/video11}"
+mkdir -p "$RUNTIME"
+
+for interface in piper_can tracer_can; do
+  [[ -e "/sys/class/net/$interface" ]] || {
+    echo "ERROR: $interface is absent; identify the USB-CAN adapter first" >&2
+    exit 1
+  }
+done
+for camera in "$LOCAL_PHYSICAL" "$GLOBAL_PHYSICAL"; do
+  [[ -e "$camera" ]] || { echo "ERROR: camera is absent: $camera" >&2; exit 1; }
+done
+
+echo "[1/4] SocketCAN"
+sudo -v
+sudo ip link set piper_can down 2>/dev/null || true
+sudo ip link set piper_can type can bitrate 1000000
+sudo ip link set piper_can up
+sudo ip link set tracer_can down 2>/dev/null || true
+sudo ip link set tracer_can type can bitrate 500000
+sudo ip link set tracer_can up
+
+echo "[2/4] Camera fanout"
+for name in local global tracer; do
+  pid_file="$RUNTIME/$name.pid"
+  if [[ -f "$pid_file" ]]; then
+    pid="$(<"$pid_file")"
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -TERM "$pid" 2>/dev/null || true
+  fi
+done
+sudo modprobe -r v4l2loopback 2>/dev/null || true
+sudo modprobe v4l2loopback video_nr=10,11 \
+  card_label=PiperSharedWrist,PiperSharedGlobal exclusive_caps=1,1
+setsid ffmpeg -hide_banner -loglevel warning -fflags nobuffer \
+  -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 \
+  -i "$LOCAL_PHYSICAL" -vf scale=640:480 -pix_fmt yuyv422 \
+  -f v4l2 "$LOCAL_SHARED" >"$RUNTIME/local.log" 2>&1 </dev/null &
+echo $! >"$RUNTIME/local.pid"
+setsid ffmpeg -hide_banner -loglevel warning -fflags nobuffer \
+  -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 \
+  -i "$GLOBAL_PHYSICAL" -vf 'scale=640:360,pad=640:480:0:60:black' \
+  -pix_fmt yuyv422 -f v4l2 "$GLOBAL_SHARED" \
+  >"$RUNTIME/global.log" 2>&1 </dev/null &
+echo $! >"$RUNTIME/global.pid"
+
+echo "[3/4] Tracer ROS"
+set +u
+source /opt/ros/humble/setup.bash
+source "$HOME/tracer_ros2_ws/install/setup.bash"
+set -u
+setsid ros2 launch tracer_base tracer_mini_base.launch.py port_name:=tracer_can \
+  >"$RUNTIME/tracer.log" 2>&1 </dev/null &
+echo $! >"$RUNTIME/tracer.pid"
+
+echo "[4/4] Read-only feedback checks"
+timeout 3 candump piper_can -n 1 >/dev/null
+timeout 5 ros2 topic echo /tracer_status --once >/dev/null
+for device in "$LOCAL_SHARED" "$GLOBAL_SHARED"; do
+  timeout 3 ffprobe -v error -f v4l2 -show_entries stream=width,height \
+    -of default=nw=1 "$device" >/dev/null
+done
+echo "READY FOR SHADOW — no robot motion was enabled"

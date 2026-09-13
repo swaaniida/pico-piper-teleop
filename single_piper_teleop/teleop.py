@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import signal
 import select
 import shutil
@@ -23,10 +24,12 @@ import time
 from typing import Any
 
 import numpy as np
+import cv2
 import placo
 from scipy.spatial.transform import Rotation
 import xrobotoolkit_sdk as xrt
 from piper_sdk import C_PiperInterface_V2
+from .async_jsonl import AsyncJsonlWriter
 from .wrist_camera import WristUvcCamera
 from .global_camera import GlobalWebcam
 from tracer_mini.control import (
@@ -42,7 +45,9 @@ from tracer_mini.ros_bridge import TracerRosBridge
 
 ROOT = Path(__file__).resolve().parents[1]
 URDF = ROOT / "assets" / "piper_kinematics.urdf"
-EPISODES = ROOT / "data" / "episodes"
+EPISODES = Path(
+    os.environ.get("PIPER_EPISODES_DIR", str(ROOT / "data" / "episodes"))
+).expanduser().resolve()
 CAN_NAME = "piper_can"
 CONTROL_HZ = 50.0
 DT = 1.0 / CONTROL_HZ
@@ -60,10 +65,14 @@ GRIPPER_OPEN_MM = 70.0
 GRIPPER_CLOSED_MM = 0.0
 MOVE_SPEED_PERCENT = 100
 INIT_MOVE_SPEED_PERCENT = 50
+AUTO_INIT_SPEED_PERCENT = 50
+AUTO_INIT_JOINT_SPEED_DEG_S = 25.0
+CUP_APPROACH_JOINT_SPEED_DEG_S = 20.0
+CUP_CLEARANCE_M = 0.08
 # The reference ZIP uses J3=+1.60 deg, but this arm clamps J3 at its 0 deg
 # boundary. Use the measured reachable equivalent so arrival can be confirmed.
 JOINTS_START_DEG = np.array([-0.51, 0.49, 0.0, 3.96, 4.83, -8.33])
-JOINTS_INIT_DEG = np.array([-1.86, 23.84, -60.0, 1.60, 50.65, 0.0])
+JOINTS_INIT_DEG = np.array([-1.0, 23.84, -60.0, 0.0, 50.65, -1.5])
 FEEDBACK_STALE_S = 0.10
 MIN_EPISODE_DURATION_S = 2.0
 TRACER_CAN_NAME = "tracer_can"
@@ -73,6 +82,268 @@ TRACER_LINEAR_MPS = 0.15
 TRACER_ANGULAR_RAD_S = 0.40
 R_HEADSET_WORLD = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
+PREVIEW_WINDOW = "PiPER Teleop Cameras"
+PICO_VIDEO_PID_FILE = ROOT / ".runtime" / "pico_h264_sender.pid"
+FLOOR_INIT_CONFIG = ROOT / "config" / "floor_pick_init.json"
+CUP_DROP_CONFIG = ROOT / "config" / "cup_drop_pose.json"
+# Normalized global-camera target region. This is display-only and is not
+# burned into the recorded training images.
+GLOBAL_AID_CENTER_XY = (0.52, .89)
+GLOBAL_AID_RADIUS_X = 0.16
+GLOBAL_CAMERA_HEIGHT_M = 0.355
+GLOBAL_CAMERA_DOWN_DEG = 60.0
+GLOBAL_CAMERA_HFOV_DEG = 106.0
+_preview_window_initialized = False
+
+
+def build_ball_position_plan() -> list[tuple[int, int]]:
+    """Build the deterministic, mixed 100-episode lateral/distance plan."""
+    lateral = (-20, -10, 0, 10, 20)
+    # With the global camera at 35.5 cm and pitched 60 deg downward, these
+    # distances remain inside its 1280x720 / 106-deg-HFOV image, including
+    # the +/-20 cm lateral extremes. D70 at the center was reachable in
+    # episode 2; the former R30/D75 corner in episode 3 was not. Keep that
+    # verified distance while pulling all combined extremes inward.
+    distance = (45, 50, 60, 65, 70)
+    counts = (
+        (2, 3, 4, 3, 2),
+        (3, 5, 6, 5, 3),
+        (4, 6, 8, 6, 4),
+        (3, 5, 6, 5, 3),
+        (2, 3, 4, 3, 2),
+    )
+    remaining = {
+        (lateral[x], distance[y]): counts[y][x]
+        for y in range(5) for x in range(5)
+    }
+    rng = random.Random(20260909)
+    plan: list[tuple[int, int]] = []
+    while remaining:
+        candidates = list(remaining)
+        if plan and len(candidates) > 1:
+            candidates = [key for key in candidates if key != plan[-1]]
+        if plan:
+            strongly_mixed = [
+                key for key in candidates
+                if key[0] != plan[-1][0] and key[1] != plan[-1][1]
+            ]
+            if strongly_mixed:
+                candidates = strongly_mixed
+        weights = [remaining[key] for key in candidates]
+        selected = rng.choices(candidates, weights=weights, k=1)[0]
+        plan.append(selected)
+        remaining[selected] -= 1
+        if remaining[selected] == 0:
+            del remaining[selected]
+    if len(plan) >= 2 and plan[-1] == plan[-2]:
+        for index in range(1, len(plan) - 2):
+            replacement = plan[index]
+            if (
+                replacement != plan[-2]
+                and plan[-1] != plan[index - 1]
+                and plan[-1] != plan[index + 1]
+            ):
+                plan[index], plan[-1] = plan[-1], replacement
+                break
+    return plan
+
+
+BALL_POSITION_PLAN = build_ball_position_plan()
+
+
+def ball_target_label(index: int) -> str:
+    if index >= len(BALL_POSITION_PLAN):
+        return "100/100 DONE"
+    lateral_cm, distance_cm = BALL_POSITION_PLAN[index]
+    lateral = "C" if lateral_cm == 0 else f"{'L' if lateral_cm < 0 else 'R'}{abs(lateral_cm)}"
+    return f"{index + 1:03d}/100  {lateral}  D{distance_cm}"
+
+
+def completed_planned_episodes() -> int:
+    completed = 0
+    for metadata_path in EPISODES.glob("*/metadata.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if metadata.get("status") == "complete" and int(metadata.get("workflow_version", 1)) >= 3:
+            completed += 1
+    return min(completed, len(BALL_POSITION_PLAN))
+
+
+def load_floor_init() -> np.ndarray:
+    if not FLOOR_INIT_CONFIG.exists():
+        return JOINTS_INIT_DEG.copy()
+    payload = json.loads(FLOOR_INIT_CONFIG.read_text(encoding="utf-8"))
+    joints = np.asarray(payload["joint_deg"], dtype=float)
+    if joints.shape != (6,) or not np.all(np.isfinite(joints)):
+        raise RuntimeError(f"invalid floor init config: {FLOOR_INIT_CONFIG}")
+    return joints
+
+
+def load_cup_drop_pose() -> tuple[np.ndarray, np.ndarray]:
+    if not CUP_DROP_CONFIG.exists():
+        raise RuntimeError(f"cup drop pose is not calibrated: run ./calibrate-drop")
+    payload = json.loads(CUP_DROP_CONFIG.read_text(encoding="utf-8"))
+    joints = np.asarray(payload["joint_deg"], dtype=float)
+    transform = np.asarray(payload["link6_transform"], dtype=float)
+    if joints.shape != (6,) or not np.all(np.isfinite(joints)):
+        raise RuntimeError(f"invalid cup drop joints: {CUP_DROP_CONFIG}")
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise RuntimeError(f"invalid cup drop EE transform: {CUP_DROP_CONFIG}")
+    return joints, transform
+
+
+def solve_cup_clearance_pose() -> np.ndarray:
+    """Find a vertical pre-drop waypoint while retaining the saved EE attitude."""
+    drop_joints, target = load_cup_drop_pose()
+    target = target.copy()
+    target[2, 3] += CUP_CLEARANCE_M
+
+    robot = placo.RobotWrapper(str(URDF))
+    solver = placo.KinematicsSolver(robot)
+    solver.dt = DT
+    solver.mask_fbase(True)
+    robot.state.q[:7] = np.array([0, 0, 0, 0, 0, 0, 1], dtype=float)
+    robot.state.q[7:13] = np.radians(drop_joints)
+    robot.update_kinematics()
+    task = solver.add_frame_task("link6", target)
+    task.configure("cup_clearance", "soft", 1.0)
+    regularization = solver.add_joints_task()
+    regularization.set_joints({
+        name: robot.state.q[7 + index]
+        for index, name in enumerate(JOINT_NAMES)
+    })
+    regularization.configure("cup_clearance_regularization", "soft", 1e-4)
+    for _ in range(500):
+        solver.solve(True)
+        robot.update_kinematics()
+    actual = robot.get_T_world_frame("link6")
+    position_error = float(np.linalg.norm(actual[:3, 3] - target[:3, 3]))
+    rotation_error = float(Rotation.from_matrix(
+        actual[:3, :3].T @ target[:3, :3]
+    ).magnitude())
+    if position_error > 0.005 or rotation_error > math.radians(2.0):
+        raise RuntimeError(
+            "cup clearance IK is not safely reachable: "
+            f"position_error={position_error:.4f}m, rotation_error={math.degrees(rotation_error):.2f}deg"
+        )
+    return np.degrees(robot.state.q[7:13].copy())
+
+
+def draw_global_aid(frame: np.ndarray) -> np.ndarray:
+    """Draw the display-only locomotion target as an upward semicircle."""
+    result = frame.copy()
+    height, width = result.shape[:2]
+    center = (
+        round(GLOBAL_AID_CENTER_XY[0] * width),
+        round(GLOBAL_AID_CENTER_XY[1] * height),
+    )
+    radius = round(GLOBAL_AID_RADIUS_X * width)
+    overlay = result.copy()
+    cv2.ellipse(overlay, center, (radius, radius), 0, 180, 360,
+                (40, 220, 40), -1, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.18, result, 0.82, 0, result)
+    cv2.ellipse(result, center, (radius, radius), 0, 180, 360,
+                (40, 230, 40), 4, cv2.LINE_AA)
+    cv2.line(result, (center[0] - radius, center[1]),
+             (center[0] + radius, center[1]), (40, 230, 40), 4, cv2.LINE_AA)
+    cv2.circle(result, center, 6, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(result, center, 6, (40, 230, 40), 2, cv2.LINE_AA)
+    return result
+
+
+def draw_ball_setup_target(
+    frame: np.ndarray, lateral_cm: int, distance_cm: int
+) -> np.ndarray:
+    """Project a ground target into the fixed global camera for setup only."""
+    result = frame.copy()
+    height, width = result.shape[:2]
+    theta = math.radians(GLOBAL_CAMERA_DOWN_DEG)
+    focal_px = (width / 2.0) / math.tan(math.radians(GLOBAL_CAMERA_HFOV_DEG) / 2.0)
+    lateral_m = lateral_cm / 100.0
+    forward_m = distance_cm / 100.0
+    # Camera coordinates: +x image-right, +y image-down, +z optical-forward.
+    camera_z = forward_m * math.cos(theta) + GLOBAL_CAMERA_HEIGHT_M * math.sin(theta)
+    camera_y = -forward_m * math.sin(theta) + GLOBAL_CAMERA_HEIGHT_M * math.cos(theta)
+    if camera_z <= 0.0:
+        return result
+    raw_u = width / 2.0 + focal_px * lateral_m / camera_z
+    raw_v = height / 2.0 + focal_px * camera_y / camera_z
+    margin = 22
+    u = int(round(np.clip(raw_u, margin, width - margin - 1)))
+    v = int(round(np.clip(raw_v, margin, height - margin - 1)))
+    outside = raw_u != np.clip(raw_u, margin, width - margin - 1) or raw_v != np.clip(
+        raw_v, margin, height - margin - 1
+    )
+    color = (255, 0, 255)
+    cv2.circle(result, (u, v), 13, (255, 255, 255), 4, cv2.LINE_AA)
+    cv2.circle(result, (u, v), 9, color, -1, cv2.LINE_AA)
+    cv2.drawMarker(result, (u, v), (0, 0, 0), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+    if outside:
+        cv2.putText(result, "OUT", (max(4, u - 24), min(height - 5, v + 34)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    return result
+
+
+def show_camera_preview(
+    camera, global_camera, recording: bool, status_text: str,
+    setup_target_cm: tuple[int, int] | None = None,
+) -> bool:
+    """Show wrist and global cameras together; return False on Q/Esc."""
+    global _preview_window_initialized
+    wrist = camera.latest_frame() if camera is not None else None
+    global_frame = global_camera.latest_frame() if global_camera is not None else None
+    if wrist is None and global_frame is None:
+        return True
+
+    panels = []
+    for frame, label in ((wrist, "LOCAL / WRIST"), (global_frame, "GLOBAL")):
+        panel = np.zeros((360, 640, 3), dtype=np.uint8)
+        if frame is not None:
+            frame = frame.copy()
+            if label == "GLOBAL":
+                if recording:
+                    frame = draw_global_aid(frame)
+                elif setup_target_cm is not None:
+                    frame = draw_ball_setup_target(frame, *setup_target_cm)
+            height, width = frame.shape[:2]
+            scale = min(640.0 / width, 360.0 / height)
+            resized = cv2.resize(frame, (round(width * scale), round(height * scale)))
+            y = (360 - resized.shape[0]) // 2
+            x = (640 - resized.shape[1]) // 2
+            panel[y:y + resized.shape[0], x:x + resized.shape[1]] = resized
+        cv2.rectangle(panel, (0, 0), (220, 34), (0, 0, 0), -1)
+        cv2.putText(panel, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        if recording:
+            cv2.circle(panel, (615, 18), 8, (0, 0, 255), -1)
+        panels.append(panel)
+    if not _preview_window_initialized:
+        cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(
+            PREVIEW_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+        )
+        _preview_window_initialized = True
+    preview = np.hstack(panels)
+    text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+    text_x = max((preview.shape[1] - text_size[0]) // 2, 0)
+    cv2.rectangle(preview, (text_x - 12, 0),
+                  (text_x + text_size[0] + 12, 38), (0, 0, 0), -1)
+    cv2.putText(preview, status_text, (text_x, 27), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.imshow(PREVIEW_WINDOW, preview)
+    key = cv2.waitKey(1) & 0xFF
+    return key not in (27, ord("q"), ord("Q"))
+
+
+def close_camera_preview() -> None:
+    global _preview_window_initialized
+    try:
+        cv2.destroyWindow(PREVIEW_WINDOW)
+    except cv2.error:
+        pass
+    _preview_window_initialized = False
 
 
 class OneEuroFilter:
@@ -280,7 +551,12 @@ class RightPicoIK:
         self.pos_filter = None
         self.rot_filter = None
 
-    def solve(self, xr_pose: np.ndarray, tracker_pose: np.ndarray | None = None) -> np.ndarray:
+    def solve(
+        self,
+        xr_pose: np.ndarray,
+        tracker_pose: np.ndarray | None = None,
+        locked_lateral_y: float | None = None,
+    ) -> np.ndarray:
         if self.ref_ee is None:
             raise RuntimeError("clutch reference is absent")
         pos, rot = self.world_pose(xr_pose)
@@ -288,6 +564,8 @@ class RightPicoIK:
         delta_pos = (pos - self.ref_controller_pos) * POSITION_SCALE
         target = self.ref_ee.copy()
         target[:3, 3] += delta_pos
+        if locked_lateral_y is not None:
+            target[1, 3] = locked_lateral_y
         if ROTATION_SCALE:
             rot = Rotation.from_rotvec(self.rot_filter.filter(rot.as_rotvec()))
             delta_rotvec = (rot * self.ref_controller_rot.inv()).as_rotvec() * ROTATION_SCALE
@@ -322,9 +600,13 @@ def validate_joint_target(solved: np.ndarray) -> np.ndarray:
     return solved
 
 
-def move_to_pose(piper: C_PiperInterface_V2, joints_deg: np.ndarray) -> None:
+def move_to_pose(
+    piper: C_PiperInterface_V2,
+    joints_deg: np.ndarray,
+    speed_percent: int = INIT_MOVE_SPEED_PERCENT,
+) -> None:
     """Match PiperFollower's direct initial/rest pose command."""
-    piper.MotionCtrl_2(0x01, 0x01, INIT_MOVE_SPEED_PERCENT, 0x00)
+    piper.MotionCtrl_2(0x01, 0x01, speed_percent, 0x00)
     piper.JointCtrl(*(int(round(v * 1000.0)) for v in joints_deg))
 
 
@@ -337,10 +619,23 @@ def wait_for_pose(
     target: np.ndarray,
     timeout_s: float = 10.0,
     monitor_b: bool = False,
+    max_joint_speed_deg_s: float | None = None,
+    sample_callback: Any | None = None,
 ) -> None:
     """Stream a return target until feedback confirms it before torque release."""
+    start, _, hz = piper_joints(piper)
+    if hz <= 0:
+        raise RuntimeError("PiPER feedback absent before pose move")
+    move_started = time.monotonic()
+    move_duration = 0.0
+    if max_joint_speed_deg_s is not None:
+        if max_joint_speed_deg_s <= 0:
+            raise ValueError("max_joint_speed_deg_s must be positive")
+        move_duration = float(np.max(np.abs(target - start))) / max_joint_speed_deg_s
+        timeout_s = max(timeout_s, move_duration + 3.0)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        iteration_started = time.monotonic()
         if monitor_b and bool(xrt.get_B_button()):
             current, _, hz = piper_joints(piper)
             if hz > 0:
@@ -351,9 +646,24 @@ def wait_for_pose(
             raise RuntimeError(f"return aborted by PiPER state: {state}")
         current, _, hz = piper_joints(piper)
         if hz > 0 and np.max(np.abs(current - target)) <= 0.5:
+            if sample_callback is not None:
+                sample_callback(target)
             return
-        move_to_pose(piper, target)
-        time.sleep(0.02)
+        commanded = target
+        speed_percent = INIT_MOVE_SPEED_PERCENT
+        if move_duration > 0.0:
+            progress = min((time.monotonic() - move_started) / move_duration, 1.0)
+            # Quintic minimum-jerk timing: zero velocity and acceleration at
+            # both ends, avoiding the visible snap of linear interpolation.
+            alpha = 10.0 * progress**3 - 15.0 * progress**4 + 6.0 * progress**5
+            commanded = start + alpha * (target - start)
+            speed_percent = AUTO_INIT_SPEED_PERCENT
+        move_to_pose(piper, commanded, speed_percent=speed_percent)
+        if sample_callback is not None:
+            sample_callback(commanded)
+        remaining = DT - (time.monotonic() - iteration_started)
+        if remaining > 0.0:
+            time.sleep(remaining)
     raise RuntimeError(f"return pose timeout; target={target.tolist()}")
 
 
@@ -369,9 +679,6 @@ def send_gripper(piper: C_PiperInterface_V2, target_mm: float) -> None:
 
 def countdown() -> None:
     print("WARNING: LIVE PiPER motion will start. Clear the workspace; keep B ready.")
-    for remaining in (3, 2, 1):
-        print(f"Starting in {remaining}...", flush=True)
-        time.sleep(1.0)
 
 
 def main() -> None:
@@ -397,12 +704,24 @@ def main() -> None:
         help="PICO Motion Tracker serial for the right elbow; empty disables it",
     )
     parser.add_argument("--with-tracer", action="store_true", help="enable left-controller Tracer teleoperation")
+    parser.add_argument(
+        "--calibrate-floor-init", action="store_true",
+        help="adjust floor-pick init with lateral translation locked; A saves it",
+    )
+    parser.add_argument(
+        "--calibrate-drop-pose", action="store_true",
+        help="adjust the cup pre-drop pose; A saves its measured EE pose",
+    )
     args = parser.parse_args()
+    if args.calibrate_floor_init and args.calibrate_drop_pose:
+        parser.error("select only one calibration mode")
+    calibration_mode = args.calibrate_floor_init or args.calibrate_drop_pose
     stop_requested = threading.Event()
+    guarded_exit_requested = threading.Event()
 
     def request_stop(signum, _frame) -> None:
-        print(f"Stop requested by signal {signum}; completing safe cleanup...", flush=True)
-        stop_requested.set()
+        print(f"Stop requested by signal {signum}; applying B guarded exit...", flush=True)
+        guarded_exit_requested.set()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
@@ -412,6 +731,30 @@ def main() -> None:
         raise RuntimeError(f"{TRACER_CAN_NAME} is absent")
 
     EPISODES.mkdir(parents=True, exist_ok=True)
+    plan_path = EPISODES / "collection_plan_100.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "seed": 20260909,
+                "plan_version": 2,
+                "coordinate_frame": "tracer_start_forward",
+                "lateral_sign": "negative=left, positive=right",
+                "global_camera_visible_only": True,
+                "global_camera_model": {
+                    "height_m": GLOBAL_CAMERA_HEIGHT_M,
+                    "down_angle_deg": GLOBAL_CAMERA_DOWN_DEG,
+                    "horizontal_fov_deg": GLOBAL_CAMERA_HFOV_DEG,
+                },
+                "positions_cm": [
+                    {"index": index + 1, "lateral": item[0], "distance": item[1]}
+                    for index, item in enumerate(BALL_POSITION_PLAN)
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    collection_plan_index = completed_planned_episodes()
     episode = None
     samples_path = None
     metadata_path = None
@@ -451,11 +794,21 @@ def main() -> None:
     }
     tracer_latched = False
     tracer_reset_sent_at = None
-    previous_x = False
+    previous_y = False
     previous_a = False
     previous_b = False
+    previous_view_switch = False
+    pico_view_global = False
     recording = False
     episode_started_monotonic = None
+    episode_phase = None
+    phase_started_monotonic = None
+    pending_event = None
+    sample_count = 0
+    manual_setup = False
+    calibration_lateral_y = None
+    calibration_locked_joints_deg = None
+    calibration_gripper_mm = None
     last_xr_ns = None
     last_xr_change = time.monotonic()
     tracker_was_available = None
@@ -464,6 +817,13 @@ def main() -> None:
     def cleanup_failed_startup() -> None:
         """Release software resources without adding any robot motion."""
         nonlocal tracer_bridge, tracer_can, raw_piper_watchdog, xrt_initialized
+        nonlocal camera, global_camera
+        if camera is not None:
+            camera.stop()
+            camera = None
+        if global_camera is not None:
+            global_camera.stop()
+            global_camera = None
         if tracer_bridge is not None:
             tracer_bridge.close()
             tracer_bridge = None
@@ -520,6 +880,32 @@ def main() -> None:
     if not xr_ready:
         cleanup_failed_startup()
         raise RuntimeError("PICO tracking stream is absent or stale")
+
+    # Camera availability is a precondition for live motion. Open both shared
+    # feeds before enabling PiPER so a failed fanout can never leave the arm at
+    # init with torque enabled.
+    preview_episode = ROOT / ".runtime" / "camera_preview"
+    try:
+        if not args.no_camera:
+            camera = WristUvcCamera(
+                device=args.wrist_camera_device, width=args.wrist_camera_width,
+                height=args.wrist_camera_height, fps=args.wrist_camera_fps,
+            )
+            camera.start(preview_episode)
+            camera.pause_recording()
+        if not args.no_global_camera:
+            global_camera = GlobalWebcam(
+                device=args.global_camera_device, width=args.global_camera_width,
+                height=args.global_camera_height, fps=args.global_camera_fps,
+            )
+            global_camera.start(preview_episode)
+            global_camera.pause_recording()
+    except Exception:
+        cleanup_failed_startup()
+        raise
+    finally:
+        shutil.rmtree(preview_episode, ignore_errors=True)
+
     if not args.dry_run:
         try:
             countdown()
@@ -532,6 +918,8 @@ def main() -> None:
             if not all(piper.GetArmEnableStatus()):
                 raise RuntimeError("PiPER enable timeout")
             current_gripper_mm = piper_snapshot(piper)["gripper_stroke_mm"]
+            if calibration_mode:
+                calibration_gripper_mm = float(current_gripper_mm)
             piper.GripperCtrl(int(round(current_gripper_mm * 1000.0)), 1000, 0x03, 0)
             # Torque-off feedback can describe a slightly sagged pose that is not
             # reachable as a commanded hold. Capture the normal return target only
@@ -547,17 +935,46 @@ def main() -> None:
             print("Moving to ZIP start pose...")
             wait_for_pose(piper, JOINTS_START_DEG, monitor_b=True)
             print("Moving to ZIP teleop init pose...")
+            # Start folded at the locomotion-safe init. The calibrated floor
+            # init is entered only after locomotion is marked complete.
             wait_for_pose(piper, JOINTS_INIT_DEG, monitor_b=True)
             joints, feedback_stamp, _ = piper_joints(piper)
             ik.sync(joints)
+            if args.calibrate_floor_init:
+                calibration_lateral_y = float(
+                    ik.robot.get_T_world_frame("link6")[1, 3]
+                )
+                calibration_locked_joints_deg = joints.copy()
             last_command = joints.copy()
             last_feedback_change = time.monotonic()
         except Exception:
-            cleanup_failed_startup()
+            # Once torque has been enabled, startup failures must use the same
+            # guarded return as a normal B/Ctrl-C exit. Camera preflight runs
+            # before this block, so ordinary camera failures never reach here.
+            try:
+                if piper is not None and any(piper.GetArmEnableStatus()):
+                    print("Startup failed: returning to ZIP start before torque release...")
+                    wait_for_pose(piper, JOINTS_START_DEG, monitor_b=False)
+                    piper.MotionCtrl_2(
+                        0x00, 0x01, INIT_MOVE_SPEED_PERCENT, 0x00
+                    )
+                    time.sleep(0.5)
+                    piper.DisableArm(7)
+                    time.sleep(1.0)
+                    print("Startup return confirmed; arm torque released.")
+            finally:
+                cleanup_failed_startup()
             raise
 
     def start_episode() -> None:
-        nonlocal episode, samples_path, metadata_path, metadata, log, camera, global_camera, recording, episode_started_monotonic
+        nonlocal episode, samples_path, metadata_path, metadata, log, camera, global_camera
+        nonlocal recording, episode_started_monotonic, episode_phase
+        nonlocal phase_started_monotonic, pending_event, sample_count, manual_setup
+        nonlocal collection_plan_index
+        if collection_plan_index >= len(BALL_POSITION_PLAN):
+            print("COLLECTION 100/100 COMPLETE")
+            return
+        lateral_cm, distance_cm = BALL_POSITION_PLAN[collection_plan_index]
         episode = EPISODES / time.strftime("%Y%m%d_%H%M%S")
         suffix = 1
         while episode.exists():
@@ -568,22 +985,28 @@ def main() -> None:
         metadata_path = episode / "metadata.json"
         try:
             if not args.no_camera:
-                camera = WristUvcCamera(
-                    device=args.wrist_camera_device,
-                    width=args.wrist_camera_width,
-                    height=args.wrist_camera_height,
-                    fps=args.wrist_camera_fps,
-                )
-                camera.start(episode)
+                if camera is None:
+                    camera = WristUvcCamera(
+                        device=args.wrist_camera_device,
+                        width=args.wrist_camera_width,
+                        height=args.wrist_camera_height,
+                        fps=args.wrist_camera_fps,
+                    )
+                    camera.start(episode)
+                else:
+                    camera.start_recording(episode)
             if not args.no_global_camera:
-                global_camera = GlobalWebcam(
-                    device=args.global_camera_device,
-                    width=args.global_camera_width,
-                    height=args.global_camera_height,
-                    fps=args.global_camera_fps,
-                )
-                global_camera.start(episode)
-            log = samples_path.open("w", encoding="utf-8")
+                if global_camera is None:
+                    global_camera = GlobalWebcam(
+                        device=args.global_camera_device,
+                        width=args.global_camera_width,
+                        height=args.global_camera_height,
+                        fps=args.global_camera_fps,
+                    )
+                    global_camera.start(episode)
+                else:
+                    global_camera.start_recording(episode)
+            log = AsyncJsonlWriter(samples_path)
         except Exception:
             if global_camera is not None:
                 global_camera.stop()
@@ -594,6 +1017,12 @@ def main() -> None:
             raise
         metadata = {
             "episode_id": episode.name, "started_wall_ns": time.time_ns(),
+            "episodes_root": str(EPISODES),
+            "collection_plan_index": collection_plan_index + 1,
+            "ball_start_target_cm": {
+                "lateral": lateral_cm,
+                "distance": distance_cm,
+            },
             "dry_run": args.dry_run, "camera_enabled": camera is not None,
             "camera_serial": "SN0001" if camera is not None else None,
             "wrist_camera_enabled": camera is not None,
@@ -610,40 +1039,95 @@ def main() -> None:
             "global_camera_fps": args.global_camera_fps if global_camera is not None else None,
             "control_hz": CONTROL_HZ, "position_scale": POSITION_SCALE,
             "rotation_scale": ROTATION_SCALE, "grip_threshold": GRIP_THRESHOLD,
+            "auto_init_joint_speed_deg_s": AUTO_INIT_JOINT_SPEED_DEG_S,
+            "auto_init_speed_percent": AUTO_INIT_SPEED_PERCENT,
             "right_elbow_tracker_serial": args.right_elbow_tracker_serial or None,
             "right_elbow_tracker_link": ELBOW_TRACKER_LINK if args.right_elbow_tracker_serial else None,
             "right_elbow_tracker_weight": ELBOW_TRACKER_WEIGHT if args.right_elbow_tracker_serial else None,
             "session_start_joint_deg": session_start_joints.tolist(),
             "episode_home_joint_deg": JOINTS_INIT_DEG.tolist(),
+            "manipulation_init_joint_deg": load_floor_init().tolist(),
+            "cup_drop_joint_deg": load_cup_drop_pose()[0].tolist(),
+            "cup_clearance_joint_deg": solve_cup_clearance_pose().tolist(),
+            "cup_clearance_m": CUP_CLEARANCE_M,
             "tracer_enabled": args.with_tracer,
             "tracer_ros_bridge": "separate_process" if args.with_tracer else None,
             "tracer_max_linear_mps": TRACER_LINEAR_MPS if args.with_tracer else None,
             "tracer_max_angular_rad_s": TRACER_ANGULAR_RAD_S if args.with_tracer else None,
+            "workflow_version": 4,
+            "phase_sequence": ["locomotion", "manipulation", "transport"],
+            "automatic_motion_recorded": True,
+            "learning_schema_version": 1,
+            "learning_schema": {
+                "observation": {
+                    "piper_joint_deg": "measured 6-DoF joint position",
+                    "piper_status.gripper_stroke_mm": "measured gripper position",
+                    "piper_status.gripper_effort": "measured gripper effort",
+                    "piper_status.end_pose_0p001": "measured SDK end pose",
+                    "tracer_status.odometry": "measured base pose and twist",
+                    "wrist_camera_frame_reference": "unmodified local RGB frame",
+                    "global_camera_frame_reference": "unmodified global RGB frame",
+                },
+                "action": {
+                    "commanded_joint_deg": "absolute 6-DoF joint target",
+                    "commanded_gripper_mm": "absolute gripper target",
+                    "tracer_command": "base linear/angular velocity target",
+                },
+                "derivable_action_representations": [
+                    "absolute", "stepwise_delta", "chunkwise_delta"
+                ],
+                "derivation_policy": (
+                    "derive representations after temporal resampling; preserve these raw "
+                    "measurements and commands as the immutable source"
+                ),
+                "model_auxiliary_only": [
+                    "episode_phase", "event", "control_source", "trajectory_subphase",
+                    "XR controller inputs"
+                ],
+            },
+            "automatic_subphases": [
+                "manipulation_init", "fold_after_pick", "cup_clearance",
+                "cup_descent", "cup_retreat", "return_after_drop",
+            ],
+            "events": [],
             "status": "recording",
         }
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         recording = True
         episode_started_monotonic = time.monotonic()
-        print(f"A: episode started: {episode.name}")
+        episode_phase = "locomotion"
+        phase_started_monotonic = episode_started_monotonic
+        pending_event = "episode_started"
+        sample_count = 0
+        manual_setup = False
+        print(f"A1 START: {episode.name} | {ball_target_label(collection_plan_index)}")
 
-    def finish_episode(status: str = "complete", reason: str = "A") -> None:
-        nonlocal episode, samples_path, metadata_path, metadata, log, camera, global_camera, recording, episode_started_monotonic
+    def finish_episode(
+        status: str = "complete", reason: str = "A",
+        returned_to_home: bool = False,
+    ) -> None:
+        nonlocal episode, samples_path, metadata_path, metadata, log, camera, global_camera
+        nonlocal recording, episode_started_monotonic, episode_phase
+        nonlocal phase_started_monotonic, pending_event, sample_count, manual_setup
+        nonlocal collection_plan_index
         if not recording:
             return
         if log is not None:
             log.flush()
             log.close()
         if camera is not None:
-            camera.stop()
-            camera = None
+            camera.pause_recording()
         if global_camera is not None:
-            global_camera.stop()
-            global_camera = None
+            global_camera.pause_recording()
         if status == "complete":
             metadata.update({"ended_wall_ns": time.time_ns(), "status": status, "stop_reason": reason,
-                             "returned_to_episode_home": True})
+                             "returned_to_episode_home": returned_to_home,
+                             "sample_count": sample_count})
             metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
             print(f"Episode saved: {samples_path}")
+            collection_plan_index = min(
+                collection_plan_index + 1, len(BALL_POSITION_PLAN)
+            )
         else:
             # Failed/aborted demonstrations are not training data.
             shutil.rmtree(episode)
@@ -651,11 +1135,192 @@ def main() -> None:
         episode = samples_path = metadata_path = metadata = log = None
         recording = False
         episode_started_monotonic = None
+        episode_phase = None
+        phase_started_monotonic = None
+        pending_event = None
+        sample_count = 0
+        manual_setup = status == "complete"
+
+    def mark_episode_event(name: str, xr_ns: int) -> None:
+        event = {
+            "name": name,
+            "timestamp_monotonic_ns": time.monotonic_ns(),
+            "timestamp_wall_ns": time.time_ns(),
+            "timestamp_xr_ns": xr_ns,
+            "sample_index": sample_count,
+        }
+        metadata["events"].append(event)
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    def record_automatic_sample(
+        commanded_joints: np.ndarray,
+        commanded_gripper_mm: float,
+        trajectory_subphase: str,
+    ) -> None:
+        """Record scripted motion on the same 50 Hz timeline as teleoperation."""
+        nonlocal sample_count, pending_event, joints, feedback_stamp
+        if not recording or log is None or piper is None:
+            return
+        measured_joints, feedback_stamp, hz = piper_joints(piper)
+        if hz <= 0:
+            raise RuntimeError("PiPER feedback absent during automatic recording")
+        joints = measured_joints.copy()
+        state = piper_snapshot(piper)
+        tracer_snapshot = tracer_bridge.snapshot() if tracer_bridge is not None else None
+        wrist_ref = camera.latest() if camera is not None else None
+        global_ref = global_camera.latest() if global_camera is not None else None
+        xr_pose = np.asarray(xrt.get_right_controller_pose(), dtype=float)
+        sample = {
+            "timestamp_monotonic_ns": time.monotonic_ns(),
+            "timestamp_wall_ns": time.time_ns(),
+            "timestamp_xr_ns": int(xrt.get_time_stamp_ns()),
+            "right_pose_xyzw": xr_pose.tolist(),
+            "right_elbow_tracker_serial": args.right_elbow_tracker_serial or None,
+            "right_elbow_tracker_pose": None,
+            "right_elbow_tracker_active": False,
+            "right_grip": float(xrt.get_right_grip()),
+            "right_trigger": float(xrt.get_right_trigger()),
+            "filtered_right_trigger": None,
+            "right_axis": list(xrt.get_right_axis()),
+            "left_axis": list(xrt.get_left_axis()),
+            "left_grip": float(xrt.get_left_grip()),
+            "recording": True,
+            "episode_phase": episode_phase,
+            "event": pending_event,
+            "control_source": "automatic",
+            "trajectory_subphase": trajectory_subphase,
+            "clutch_active": False,
+            "commanded_joint_deg": np.asarray(commanded_joints, dtype=float).tolist(),
+            "commanded_gripper_mm": float(commanded_gripper_mm),
+            "piper_joint_deg": measured_joints.tolist(),
+            "piper_status": state,
+            "piper_raw_can": raw_piper_watchdog.snapshot()
+            if raw_piper_watchdog is not None else None,
+            "tracer_command": {"linear_mps": 0.0, "angular_rad_s": 0.0},
+            "tracer_status": dict(tracer_snapshot) if tracer_snapshot is not None else None,
+            "dry_run": args.dry_run,
+            "camera_frame_reference": wrist_ref,
+            "wrist_camera_frame_reference": wrist_ref,
+            "global_camera_frame_reference": global_ref,
+        }
+        log.write(json.dumps(sample, ensure_ascii=False) + "\n")
+        sample_count += 1
+        pending_event = None
+
+    def move_piper_to_init(trajectory_subphase: str = "return_init") -> None:
+        nonlocal clutch, joints, feedback_stamp, last_command, last_feedback_change
+        if tracer_bridge is not None:
+            tracer_bridge.stop_motion()
+        if clutch:
+            ik.deactivate()
+            clutch = False
+        if piper is not None:
+            held_gripper = float(piper_snapshot(piper)["gripper_stroke_mm"])
+            wait_for_pose(
+                piper,
+                JOINTS_INIT_DEG,
+                monitor_b=True,
+                max_joint_speed_deg_s=AUTO_INIT_JOINT_SPEED_DEG_S,
+                sample_callback=lambda command: record_automatic_sample(
+                    command, held_gripper, trajectory_subphase
+                ),
+            )
+            joints, feedback_stamp, _ = piper_joints(piper)
+            ik.sync(joints)
+            last_command = joints.copy()
+            last_feedback_change = time.monotonic()
+
+    def move_piper_to_manipulation_init() -> None:
+        nonlocal clutch, joints, feedback_stamp, last_command, last_feedback_change
+        if tracer_bridge is not None:
+            tracer_bridge.stop_motion()
+        if clutch:
+            ik.deactivate()
+            clutch = False
+        if piper is not None:
+            held_gripper = float(piper_snapshot(piper)["gripper_stroke_mm"])
+            wait_for_pose(
+                piper,
+                load_floor_init(),
+                monitor_b=True,
+                max_joint_speed_deg_s=AUTO_INIT_JOINT_SPEED_DEG_S,
+                sample_callback=lambda command: record_automatic_sample(
+                    command, held_gripper, "manipulation_init"
+                ),
+            )
+            joints, feedback_stamp, _ = piper_joints(piper)
+            ik.sync(joints)
+            last_command = joints.copy()
+            last_feedback_change = time.monotonic()
+
+    def move_piper_to_cup_drop() -> None:
+        """Approach the cup vertically through an EE-derived clearance pose."""
+        nonlocal clutch, joints, feedback_stamp, last_command, last_feedback_change
+        if tracer_bridge is not None:
+            tracer_bridge.stop_motion()
+        if clutch:
+            ik.deactivate()
+            clutch = False
+        if piper is not None:
+            held_gripper = float(piper_snapshot(piper)["gripper_stroke_mm"])
+            clearance_joints = solve_cup_clearance_pose()
+            drop_joints, _ = load_cup_drop_pose()
+            wait_for_pose(
+                piper, clearance_joints, monitor_b=True,
+                max_joint_speed_deg_s=CUP_APPROACH_JOINT_SPEED_DEG_S,
+                sample_callback=lambda command: record_automatic_sample(
+                    command, held_gripper, "cup_clearance"
+                ),
+            )
+            wait_for_pose(
+                piper, drop_joints, monitor_b=True,
+                max_joint_speed_deg_s=CUP_APPROACH_JOINT_SPEED_DEG_S,
+                sample_callback=lambda command: record_automatic_sample(
+                    command, held_gripper, "cup_descent"
+                ),
+            )
+            joints, feedback_stamp, _ = piper_joints(piper)
+            ik.sync(joints)
+            last_command = joints.copy()
+            last_feedback_change = time.monotonic()
+
+    def retreat_from_cup_after_drop() -> None:
+        """Open and immediately reverse the descent to the safe clearance."""
+        nonlocal clutch, joints, feedback_stamp, last_command, last_feedback_change
+        if tracer_bridge is not None:
+            tracer_bridge.stop_motion()
+        if clutch:
+            ik.deactivate()
+            clutch = False
+        if piper is not None:
+            # GripperCtrl is non-blocking. Keep its open target active while the
+            # arm rises, so there is no visually aliased stationary segment.
+            send_gripper(piper, GRIPPER_OPEN_MM)
+            wait_for_pose(
+                piper,
+                solve_cup_clearance_pose(),
+                monitor_b=True,
+                max_joint_speed_deg_s=CUP_APPROACH_JOINT_SPEED_DEG_S,
+                sample_callback=lambda command: record_automatic_sample(
+                    command, GRIPPER_OPEN_MM, "cup_retreat"
+                ),
+            )
+            joints, feedback_stamp, _ = piper_joints(piper)
+            ik.sync(joints)
+            last_command = joints.copy()
+            last_feedback_change = time.monotonic()
     failure_reason = None
     cleanup_errors = []
     return_confirmed = False
     torque_released = False
-    print("READY AT ZIP INIT — A/Enter toggles an episode; B exits safely.")
+    if calibration_mode:
+        manual_setup = True
+        if args.calibrate_floor_init:
+            print("CALIBRATE FLOOR: J2/J3/J5 only | A=save | B=exit")
+        else:
+            print("CALIBRATE DROP: grip=full 6D adjust | A=save EE pose | B=exit")
+    else:
+        print("READY: A1 start | A2 approach | A3 pick/drop/save")
     try:
         while not stop_requested.is_set():
                 started = time.monotonic()
@@ -673,6 +1338,7 @@ def main() -> None:
                 trigger = float(xrt.get_right_trigger())
                 left_axis = list(xrt.get_left_axis())
                 right_axis = list(xrt.get_right_axis())
+                view_switch_pressed = bool(xrt.get_right_axis_click())
                 left_grip = float(xrt.get_left_grip())
                 xr_ns = int(xrt.get_time_stamp_ns())
                 if xr_ns != last_xr_ns:
@@ -690,7 +1356,8 @@ def main() -> None:
                     abs(float(left_axis[1])) <= TRACER_DEADZONE
                     and abs(float(right_axis[0])) <= TRACER_DEADZONE
                 )
-                if b_pressed and not previous_b:
+                b_exit = b_pressed and not previous_b
+                if b_exit or guarded_exit_requested.is_set():
                     if tracer_bridge is not None:
                         tracer_bridge.stop_motion()
                     if piper is not None:
@@ -702,36 +1369,105 @@ def main() -> None:
                     if clutch:
                         ik.deactivate()
                         clutch = False
-                    print("B: motion held; ending session through guarded ZIP-start return")
+                    source = "B" if b_exit else "Ctrl-C"
+                    print(f"{source}: motion held; guarded ZIP-start return")
                     break
 
+                if view_switch_pressed and not previous_view_switch:
+                    try:
+                        sender_pid = int(PICO_VIDEO_PID_FILE.read_text().strip())
+                        os.kill(sender_pid, signal.SIGUSR1)
+                        pico_view_global = not pico_view_global
+                        print(f"VIEW: {'GLOBAL' if pico_view_global else 'LOCAL'}")
+                    except (OSError, ValueError):
+                        print("VIEW: sender unavailable")
+                previous_view_switch = view_switch_pressed
+
                 if (a_pressed and not previous_a) or terminal_toggle:
-                    if recording:
-                        if time.monotonic() - episode_started_monotonic < MIN_EPISODE_DURATION_S:
-                            print("Episode stop ignored during 2s A-button debounce")
+                    if args.calibrate_floor_init:
+                        if grip <= GRIP_THRESHOLD:
+                            measured = joints.copy()
+                            ik.sync(measured)
+                            ee = ik.robot.get_T_world_frame("link6")
+                            payload = {
+                                "joint_deg": measured.round(3).tolist(),
+                                "link6_xyz_from_base_m": ee[:3, 3].round(6).tolist(),
+                                "base_height_above_floor_m": 0.38,
+                                "saved_wall_ns": time.time_ns(),
+                                "lateral_translation_locked": True,
+                            }
+                            FLOOR_INIT_CONFIG.write_text(
+                                json.dumps(payload, indent=2), encoding="utf-8"
+                            )
+                            print(f"A SAVED FLOOR INIT: {payload['joint_deg']}")
+                        else:
+                            print("A RELEASE RIGHT GRIP TO SAVE")
+                    elif args.calibrate_drop_pose:
+                        if grip <= GRIP_THRESHOLD:
+                            measured = joints.copy()
+                            ik.sync(measured)
+                            ee = ik.robot.get_T_world_frame("link6")
+                            payload = {
+                                "joint_deg": measured.round(3).tolist(),
+                                "link6_xyz_from_base_m": ee[:3, 3].round(6).tolist(),
+                                "link6_quaternion_xyzw": Rotation.from_matrix(
+                                    ee[:3, :3]
+                                ).as_quat().round(8).tolist(),
+                                "link6_transform": ee.round(8).tolist(),
+                                "saved_wall_ns": time.time_ns(),
+                                "purpose": "pre_drop_above_blue_cup",
+                            }
+                            CUP_DROP_CONFIG.write_text(
+                                json.dumps(payload, indent=2), encoding="utf-8"
+                            )
+                            print(f"A SAVED CUP DROP POSE: {payload['joint_deg']}")
+                        else:
+                            print("A RELEASE RIGHT GRIP TO SAVE")
+                    elif recording:
+                        now = time.monotonic()
+                        if now - phase_started_monotonic < MIN_EPISODE_DURATION_S:
+                            print("A WAIT")
                             previous_a = a_pressed
                             continue
-                        if tracer_bridge is not None:
-                            tracer_bridge.stop_motion()
-                        if clutch:
-                            ik.deactivate()
-                            clutch = False
-                        if piper is not None:
-                            print("A: returning to ZIP init before ending episode...")
-                            wait_for_pose(piper, JOINTS_INIT_DEG, monitor_b=True)
-                            joints, feedback_stamp, _ = piper_joints(piper)
-                            ik.sync(joints)
-                            last_command = joints.copy()
-                            last_feedback_change = time.monotonic()
-                        finish_episode()
-                        print("READY — press A for the next episode; B exits.")
+                        if episode_phase == "locomotion":
+                            mark_episode_event("locomotion_complete", xr_ns)
+                            print("A2 APPROACH -> MANIP INIT")
+                            move_piper_to_manipulation_init()
+                            episode_phase = "manipulation"
+                            phase_started_monotonic = time.monotonic()
+                            pending_event = "locomotion_complete"
+                        elif episode_phase == "manipulation":
+                            mark_episode_event("pick_complete", xr_ns)
+                            episode_phase = "transport"
+                            phase_started_monotonic = time.monotonic()
+                            pending_event = "pick_complete"
+                            print("A3 PICK -> INIT -> CUP -> DROP -> INIT")
+                            move_piper_to_init("fold_after_pick")
+                            move_piper_to_cup_drop()
+                            if piper is not None:
+                                send_gripper(piper, GRIPPER_OPEN_MM)
+                            mark_episode_event(
+                                "place_complete", int(xrt.get_time_stamp_ns())
+                            )
+                            print("DROP -> RETREAT -> INIT")
+                            retreat_from_cup_after_drop()
+                            move_piper_to_init("return_after_drop")
+                            finish_episode(
+                                reason="place_complete", returned_to_home=True
+                            )
+                            print("SAVED -> RESET BALL/TRACER -> A1 NEXT")
+                        else:
+                            raise RuntimeError(f"unexpected episode phase: {episode_phase}")
                     elif grip <= GRIP_THRESHOLD and left_grip <= TRACER_GRIP_THRESHOLD and sticks_neutral:
+                        if manual_setup:
+                            print("A1 RESET -> INIT")
+                            move_piper_to_init()
                         start_episode()
                     else:
-                        print("A ignored: release both grips and center sticks")
+                        print("A RELEASE GRIPS/STICKS")
                 previous_a = a_pressed
 
-                x_pressed = bool(xrt.get_X_button())
+                y_pressed = bool(xrt.get_Y_button())
                 tracer_command = {"linear_mps": 0.0, "angular_rad_s": 0.0}
                 if tracer_bridge is not None:
                     tracer_state = tracer_bridge.snapshot()
@@ -750,14 +1486,14 @@ def main() -> None:
                             tracer_reset_sent_at = None
                             print("Tracer E-stop remains active")
 
-                    if x_pressed and not previous_x and tracer_latched:
+                    if y_pressed and not previous_y and tracer_latched:
                         if left_grip <= TRACER_GRIP_THRESHOLD and sticks_neutral and not xr_stale:
                             tracer_bridge.stop_motion()
                             send_hardware_reset(tracer_can)
                             tracer_reset_sent_at = time.monotonic()
-                            print("X: Tracer E-stop reset requested")
+                            print("Y: Tracer E-stop reset requested")
                         else:
-                            print("X ignored: release left grip and center sticks")
+                            print("Y ignored: release left grip and center sticks")
 
                     tracer_ready = (
                         status_fresh
@@ -765,7 +1501,13 @@ def main() -> None:
                         and tracer_state["error"] == 0
                         and not tracer_latched
                         and not xr_stale
-                        and recording
+                        # Tracer is available in both pre-recording SET BALL
+                        # states, including the first one where manual_setup is
+                        # still false. PiPER remains locked there because its
+                        # clutch condition still requires recording/manual_setup.
+                        and (recording or manual_setup or episode_phase is None)
+                        and not calibration_mode
+                        and episode_phase != "manipulation"
                     )
                     if left_grip > TRACER_GRIP_THRESHOLD and tracer_ready:
                         tracer_command["linear_mps"] = tracer_axis(left_axis[1]) * TRACER_LINEAR_MPS
@@ -773,7 +1515,7 @@ def main() -> None:
                     tracer_bridge.set_command(
                         tracer_command["linear_mps"], tracer_command["angular_rad_s"]
                     )
-                previous_x = x_pressed
+                previous_y = y_pressed
                 previous_b = b_pressed
 
                 state = None
@@ -804,7 +1546,14 @@ def main() -> None:
                     ik.sync(joints)
 
                 grip_active = grip > (GRIP_RELEASE_THRESHOLD if clutch else GRIP_THRESHOLD)
-                next_clutch = grip_active and recording and not xr_stale
+                piper_phase_ready = (
+                    not recording
+                    or episode_phase in ("manipulation", "transport")
+                )
+                next_clutch = (
+                    grip_active and (recording or manual_setup)
+                    and piper_phase_ready and not xr_stale
+                )
                 if next_clutch and not clutch:
                     ik.activate(pose, tracker_pose)
                     last_command = joints.copy()
@@ -826,16 +1575,59 @@ def main() -> None:
                 filtered_trigger = trigger_input
                 gripper_target = compute_gripper_target(filtered_trigger)
                 if clutch:
-                    solved = ik.solve(pose, tracker_pose)
+                    solved = ik.solve(
+                        pose, tracker_pose,
+                        locked_lateral_y=calibration_lateral_y
+                        if args.calibrate_floor_init else None,
+                    )
                     target = validate_joint_target(solved)
+                    if args.calibrate_floor_init and calibration_locked_joints_deg is not None:
+                        # Calibration deliberately exposes only J2/J3/J5. Restore
+                        # J1/J4/J6 every cycle so neither base yaw nor wrist roll
+                        # can be introduced as an IK compensation.
+                        target[[0, 3, 5]] = calibration_locked_joints_deg[[0, 3, 5]]
                     if piper is not None:
                         send_arm(piper, target)
                     last_command = target.copy()
-                if piper is not None and recording:
+                if piper is not None and (recording or manual_setup):
+                    if calibration_mode and calibration_gripper_mm is not None:
+                        gripper_target = calibration_gripper_mm
                     send_gripper(piper, gripper_target)
 
                 wrist_camera_ref = camera.latest() if camera is not None else None
                 global_camera_ref = global_camera.latest() if global_camera is not None else None
+                if recording:
+                    collection_label = ball_target_label(collection_plan_index)
+                    preview_status = {
+                        "locomotion": "MOVE  A2",
+                        "manipulation": "PICK  A3",
+                        "transport": "AUTO DROP",
+                    }.get(episode_phase, "REC")
+                    preview_status = f"{collection_label} | {preview_status}"
+                elif args.calibrate_floor_init:
+                    preview_status = "FLOOR INIT | A SAVE"
+                elif args.calibrate_drop_pose:
+                    preview_status = "CUP POSE | A SAVE"
+                elif manual_setup:
+                    preview_status = (
+                        f"{ball_target_label(collection_plan_index)} | SET BALL  A1"
+                    )
+                else:
+                    preview_status = (
+                        f"{ball_target_label(collection_plan_index)} | SET BALL  A1"
+                    )
+                setup_target_cm = None
+                if (
+                    not recording and not calibration_mode
+                    and collection_plan_index < len(BALL_POSITION_PLAN)
+                ):
+                    setup_target_cm = BALL_POSITION_PLAN[collection_plan_index]
+                if not show_camera_preview(
+                    camera, global_camera, recording, preview_status,
+                    setup_target_cm=setup_target_cm,
+                ):
+                    print("Camera preview: Q/Esc requested safe session exit")
+                    stop_requested.set()
                 sample = {
                     "timestamp_monotonic_ns": time.monotonic_ns(),
                     "timestamp_wall_ns": time.time_ns(),
@@ -851,6 +1643,10 @@ def main() -> None:
                     "left_axis": left_axis,
                     "left_grip": left_grip,
                     "recording": recording,
+                    "episode_phase": episode_phase,
+                    "event": pending_event,
+                    "control_source": "teleoperation",
+                    "trajectory_subphase": None,
                     "clutch_active": clutch,
                     "commanded_joint_deg": target.tolist(),
                     "commanded_gripper_mm": gripper_target,
@@ -868,17 +1664,64 @@ def main() -> None:
                 }
                 if recording and log is not None:
                     log.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                    sample_count += 1
+                    pending_event = None
                 elapsed = time.monotonic() - started
                 if elapsed < DT:
                     time.sleep(DT - elapsed)
+    except EmergencyStopRequested as exc:
+        failure_reason = f"{type(exc).__name__}: {exc}"
+        # B/Ctrl-C during an automatic move is still a normal guarded exit:
+        # hold immediately, then let finally return to ZIP start and release.
+        print(f"B: motion held; guarded ZIP-start return ({exc})")
     except Exception as exc:
         failure_reason = f"{type(exc).__name__}: {exc}"
-        if isinstance(exc, EmergencyStopRequested):
-            unsafe_stop = True
+        # Unknown failures must not introduce additional robot motion.
+        unsafe_stop = True
         raise
     finally:
+        # Stop producing episode files immediately, but do not wait for USB.
+        # Robot return and torque release take priority over draining queues.
         if recording:
-            finish_episode(status="incomplete", reason=failure_reason or "session exit")
+            try:
+                if camera is not None:
+                    camera.pause_recording(wait_for_writes=False)
+                if global_camera is not None:
+                    global_camera.pause_recording(wait_for_writes=False)
+            except Exception as exc:
+                cleanup_errors.append(f"record_pause: {type(exc).__name__}: {exc}")
+        try:
+            if tracer_bridge is not None:
+                tracer_bridge.stop_motion()
+        except Exception as exc:
+            cleanup_errors.append(f"tracer_hold: {type(exc).__name__}: {exc}")
+        if piper is not None and not unsafe_stop:
+            try:
+                print("Returning to ZIP start pose before storage cleanup...")
+                wait_for_pose(piper, JOINTS_START_DEG, monitor_b=False)
+                return_confirmed = True
+                piper.MotionCtrl_2(0x00, 0x01, INIT_MOVE_SPEED_PERCENT, 0x00)
+                time.sleep(0.5)
+                piper.DisableArm(7)
+                time.sleep(1.0)
+                torque_released = not any(piper.GetArmEnableStatus())
+                print("Return confirmed; arm torque released. Finishing storage cleanup...")
+            except Exception as exc:
+                unsafe_stop = True
+                cleanup_errors.append(f"robot: {type(exc).__name__}: {exc}")
+
+        if recording:
+            try:
+                finish_episode(
+                    status="incomplete", reason=failure_reason or "session exit"
+                )
+            except Exception as exc:
+                # The arm has already returned and released torque. Preserve a
+                # partially written episode for manual recovery, but continue
+                # releasing all remaining software/device resources.
+                cleanup_errors.append(
+                    f"episode_cleanup: {type(exc).__name__}: {exc}"
+                )
         try:
             if tracer_bridge is not None:
                 tracer_bridge.close()
@@ -898,30 +1741,16 @@ def main() -> None:
             xrt.close()
         except Exception as exc:
             cleanup_errors.append(f"xr: {type(exc).__name__}: {exc}")
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
         if raw_piper_watchdog is not None:
             raw_piper_watchdog.stop()
         if tracer_can is not None:
             tracer_can.close()
         if piper is not None:
-            try:
-                # B/Ctrl-C normal session exit: ZIP start, confirm, standby, release.
-                # Error/stale feedback: never add motion or release supporting torque.
-                if not unsafe_stop:
-                    print("Returning to ZIP start pose before torque release...")
-                    wait_for_pose(piper, JOINTS_START_DEG, monitor_b=False)
-                    return_confirmed = True
-                    piper.MotionCtrl_2(0x00, 0x01, INIT_MOVE_SPEED_PERCENT, 0x00)
-                    time.sleep(0.5)
-                    piper.DisableArm(7)
-                    time.sleep(1.0)
-                    torque_released = not any(piper.GetArmEnableStatus())
-                    print("Return confirmed; arm torque released.")
-            except Exception as exc:
-                if isinstance(exc, EmergencyStopRequested):
-                    unsafe_stop = True
-                cleanup_errors.append(f"robot: {type(exc).__name__}: {exc}")
-            finally:
-                piper.DisconnectPort()
+            piper.DisconnectPort()
 
 
 if __name__ == "__main__":

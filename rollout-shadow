@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+set +u
+source /opt/ros/humble/setup.bash
+source "$HOME/tracer_ros2_ws/install/setup.bash"
+set -u
+cd "$ROOT"
+PYTHON="${PIPER_ROLLOUT_PYTHON:-python3}"
+exec "$PYTHON" -m single_piper_rollout.cli "$@"

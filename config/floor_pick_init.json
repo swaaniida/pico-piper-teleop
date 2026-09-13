@@ -1,0 +1,18 @@
+{
+  "joint_deg": [
+    -0.995,
+    111.194,
+    -59.869,
+    0.0,
+    20.296,
+    -1.569
+  ],
+  "link6_xyz_from_base_m": [
+    0.354336,
+    -0.006156,
+    0.127268
+  ],
+  "base_height_above_floor_m": 0.38,
+  "saved_wall_ns": 1788907962186300011,
+  "lateral_translation_locked": true
+}

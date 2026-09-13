@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+HOST="${1:-MoAI-Eddy-swaaniida}"
+REMOTE_DIR="${2:-piper-tracer/handoff}"
+
+ssh "$HOST" "mkdir -p ~/$REMOTE_DIR/docs ~/$REMOTE_DIR/deployment ~/$REMOTE_DIR/prompts ~/$REMOTE_DIR/tools"
+rsync -avP \
+  "$ROOT/docs/INFERENCE_ROLLOUT.md" \
+  "$HOST:~/$REMOTE_DIR/docs/"
+rsync -avP \
+  "$ROOT/deployment/checkpoint-manifest.example.json" \
+  "$HOST:~/$REMOTE_DIR/deployment/"
+rsync -avP \
+  "$ROOT/prompts/EDDY_PUBLISH_CHECKPOINTS.md" \
+  "$HOST:~/$REMOTE_DIR/prompts/"
+rsync -avP \
+  "$ROOT/tools/verify_rollout_bundle.py" \
+  "$HOST:~/$REMOTE_DIR/tools/"
+
+echo "Handoff uploaded to $HOST:~/$REMOTE_DIR"
+echo "On Eddy, read: ~/$REMOTE_DIR/prompts/EDDY_PUBLISH_CHECKPOINTS.md"
