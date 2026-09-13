@@ -1,0 +1,18 @@
+{
+  "selected_step": 200000,
+  "validation": {
+    "available": false,
+    "reason": "Training config has env=null; no validation or physical rollout metric was recorded."
+  },
+  "final_training_log": {
+    "timestamp_utc": "2026-09-13T06:39:04Z",
+    "loss": 0.024,
+    "gradient_norm": 1.519,
+    "learning_rate": 1e-05,
+    "update_seconds": 0.072,
+    "data_seconds": 0.236,
+    "wandb_project": "floor-1ball",
+    "wandb_run_id": "vnebn9hh"
+  },
+  "selection_basis": "Latest explicit completed 200000-step artifact; not claimed as best because no validation or rollout comparison exists."
+}
