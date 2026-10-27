@@ -1,0 +1,2 @@
+# Preserve upstream whitespace in diff context for exact patch application.
+*.patch -whitespace

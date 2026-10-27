@@ -1,5 +1,9 @@
 # PICO–PiPER–Tracer Teleoperation
 
+PICO local/global 카메라 전체 시야 표시, 앱 빌드·설치와 전송 구조는
+[PICO_CAMERA_VIEW.md](docs/PICO_CAMERA_VIEW.md)에 정리했다. Unity 변경 패치와
+builder는 `deployment/pico-local-view/`에 있다.
+
 오른쪽 PICO 컨트롤러로 PiPER를, 왼쪽 컨트롤러로 Tracer Mini를 조작한다.
 손목 InnoMaker RGB 영상과 로봇/XR 데이터를 같은 episode에 저장한다.
 새 InnoMaker U20CAM을 global camera로 함께 사용한다.

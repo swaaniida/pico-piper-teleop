@@ -1,0 +1,397 @@
+diff --git a/Assets/Main.unity b/Assets/Main.unity
+index f945bfa..0553af2 100644
+--- a/Assets/Main.unity
++++ b/Assets/Main.unity
+@@ -22586,7 +22586,7 @@ MonoBehaviour:
+   firstCamera: {fileID: 1261090017}
+   secondCamera: {fileID: 517948298}
+   nearClipValueA: 0.1
+-  nearClipValueB: 0.35
++  nearClipValueB: 1
+   remoteCameraWindow: {fileID: 6009550096432242019}
+ --- !u!1 &2071147983
+ GameObject:
+diff --git a/Assets/Scripts/Camera/RemoteCameraWindow.cs b/Assets/Scripts/Camera/RemoteCameraWindow.cs
+index 18d3e6d..1163d68 100644
+--- a/Assets/Scripts/Camera/RemoteCameraWindow.cs
++++ b/Assets/Scripts/Camera/RemoteCameraWindow.cs
+@@ -20,7 +20,8 @@ public class RemoteCameraWindow : MonoBehaviour
+     private TcpClient _client;
+     private NetworkStream _stream;
+     private Texture2D _texture;
+-    public Texture2D Texture => _texture;
++    private RenderTexture _displayTexture;
++    public Texture Texture => _displayTexture != null ? _displayTexture : _texture;
+     private byte[] _imageBuffer;
+     private CancellationTokenSource _receiveImageTs = null;
+     private Task _imageReceiveTask;
+@@ -85,6 +86,12 @@ public class RemoteCameraWindow : MonoBehaviour
+             Destroy(_texture);
+             _texture = null;
+         }
++        if (_displayTexture != null)
++        {
++            _displayTexture.Release();
++            Destroy(_displayTexture);
++            _displayTexture = null;
++        }
+         Debug.Log("RemoteCameraWindow OnDisable");
+         TcpHandler.SendFunctionValue("StopReceivePcCamera", "");
+     }
+@@ -103,7 +110,11 @@ public class RemoteCameraWindow : MonoBehaviour
+         Debug.Log("StartListen port:" + port);
+ 
+         _texture = new Texture2D(_resolutionWidth, _resolutionHeight, TextureFormat.RGB24, false, false);
+-        RemoteCameraImage.texture = _texture;
++        _displayTexture = new RenderTexture(
++            _resolutionWidth, _resolutionHeight, 0, RenderTextureFormat.ARGB32);
++        _displayTexture.name = "Remote Camera Stable Display";
++        _displayTexture.Create();
++        RemoteCameraImage.texture = _displayTexture;
+         yield return null;
+ 
+         MediaDecoder.initialize((int)_texture.GetNativeTexturePtr(), _resolutionWidth, _resolutionHeight);
+@@ -158,6 +169,11 @@ public class RemoteCameraWindow : MonoBehaviour
+             {
+                 MediaDecoder.updateTexture();
+                 GL.InvalidateState();
++                // The native decoder swaps/writes its GL texture during this
++                // call. Never expose that texture directly to the XR canvases:
++                // retain a Unity-owned copy so a decoder buffer transition
++                // cannot reveal the layer below for one rendered frame.
++                Graphics.Blit(_texture, _displayTexture);
+                 _textureUpdates++;
+             }
+             double elapsedMs =
+diff --git a/Assets/Scripts/Conf/VideoSourceManager.cs b/Assets/Scripts/Conf/VideoSourceManager.cs
+index d30aa96..8416a91 100644
+--- a/Assets/Scripts/Conf/VideoSourceManager.cs
++++ b/Assets/Scripts/Conf/VideoSourceManager.cs
+@@ -57,6 +57,10 @@ namespace Robot.Conf
+             LogWindow.Info($"RectTransform Size: {rawImageRect.sizeDelta}");
+ 
+             // Update SetLERE component
++            setLere.SetFullscreenMono(string.Equals(
++                videoSource.name,
++                "LOCAL_INNOMAKER",
++                StringComparison.OrdinalIgnoreCase));
+             setLere.UpdateParameters(videoSourceConfigManager.VisibleRatio,
+                 videoSourceConfigManager.ContentRatio, videoSourceConfigManager.HeightCompressionFactor);
+ 
+@@ -91,4 +95,4 @@ namespace Robot.Conf
+             GUILayout.EndVertical();
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Assets/Scripts/Li/SampleRT.shader b/Assets/Scripts/Li/SampleRT.shader
+index 7cf843b..9805d28 100644
+--- a/Assets/Scripts/Li/SampleRT.shader
++++ b/Assets/Scripts/Li/SampleRT.shader
+@@ -89,6 +89,7 @@ Shader "Custom/SampleRT"
+         _visibleRatio ("Visible Ratio", Range(0.0, 2.0)) = 1.0
+         _contentRatio ("Content Ratio", Range(0.0, 2.0)) = 0.555
+         _heightCompressionFactor ("Height Compression", Range(0.0, 2.0)) = 1.25
++        _fullscreenMono ("Fullscreen Mono", Range(0.0, 1.0)) = 0.0
+     }
+     SubShader
+     {
+@@ -117,6 +118,7 @@ Shader "Custom/SampleRT"
+             float _contentRatio;
+             float _visibleRatio;
+             float _heightCompressionFactor;
++            float _fullscreenMono;
+             
+             v2f vert (appdata v)
+             {
+@@ -129,6 +131,22 @@ Shader "Custom/SampleRT"
+             fixed4 frag (v2f i) : SV_Target
+             {   
+                 fixed4 col = fixed4(0.0, 0.0, 0.0, 0.0);
++
++                // The PC duplicates the mono image side-by-side. Sampling the
++                // matching half for each eye fills the complete eye texture and
++                // yields identical imagery without synthetic stereo disparity.
++                if (_fullscreenMono > 0.5)
++                {
++                    float sourceX = i.uv.x * 0.5 + (_isLE == 1 ? 0.0 : 0.5);
++                    fixed4 video = tex2D(_mainRT, float2(sourceX, i.uv.y));
++                    // MediaCodec may expose an undefined/zero alpha channel
++                    // while it swaps decoded buffers. PICO uses framebuffer
++                    // alpha for passthrough composition, so that transient zero
++                    // revealed the legacy stereo view once per buffer cycle.
++                    // The camera is RGB-only: make the full-scene layer opaque.
++                    video.a = 1.0;
++                    return video;
++                }
+                 
+                 // Adjust UV coordinates based on eye
+                 float2 adjusted_uv = i.uv;
+@@ -193,4 +211,4 @@ Shader "Custom/SampleRT"
+             ENDCG
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Assets/Scripts/Li/SetLERE.cs b/Assets/Scripts/Li/SetLERE.cs
+index 9af8176..48e5d8f 100644
+--- a/Assets/Scripts/Li/SetLERE.cs
++++ b/Assets/Scripts/Li/SetLERE.cs
+@@ -20,9 +20,12 @@ public class SetLERE : MonoBehaviour
+     private float contentRatio = 1.8f;
+     private float heightCompressionFactor = 1.333333f; // 4:3 aspect ratio
+     private bool projectionSuspended;
++    private bool fullscreenMono;
+     private bool canvasStateCaptured;
+     private bool canvLEWasActive;
+     private bool canvREWasActive;
++    private const float LegacyPlaneDistance = 0.31f;
++    private const float FullscreenPlaneDistance = 0.75f;
+ 
+     public bool ProjectionSuspended => projectionSuspended;
+ 
+@@ -36,6 +39,45 @@ public class SetLERE : MonoBehaviour
+         // Log the updated values
+         Debug.Log($"Updated Ratios - visible: {visibleRatio}, content: {contentRatio}, heightCompression: {heightCompressionFactor}");
+     }
++
++    public void SetFullscreenMono(bool enabled)
++    {
++        fullscreenMono = enabled;
++        if (remoteCameraWindow != null && remoteCameraWindow.RemoteCameraImage != null)
++        {
++            // The legacy RawImage is a second copy behind the per-eye canvases.
++            // Do not stack both display paths in full-scene mode.
++            remoteCameraWindow.RemoteCameraImage.enabled = !enabled;
++        }
++        ApplyFullscreenMono(matLE, enabled);
++        ApplyFullscreenMono(matRE, enabled);
++
++        // These are Screen Space - Camera canvases, one per eye. Draw them after
++        // the normal control panel so the camera becomes the complete XR scene.
++        foreach (GameObject canvasObject in new[] { CanvLE, CanvRE })
++        {
++            if (canvasObject == null) continue;
++            Canvas canvas = canvasObject.GetComponent<Canvas>();
++            if (canvas == null) continue;
++            canvas.overrideSorting = enabled;
++            canvas.sortingOrder = enabled ? 1000 : 0;
++            // Keep the video plane well away from the XR cameras' near-clip
++            // boundary. The old 0.31 m plane was only 4 cm inside the B-button
++            // 0.35 m clip value and flickered as the per-eye projection updated.
++            canvas.planeDistance = enabled
++                ? FullscreenPlaneDistance
++                : LegacyPlaneDistance;
++        }
++        Debug.Log($"Remote camera fullscreen mono: {enabled}");
++    }
++
++    private static void ApplyFullscreenMono(Material material, bool enabled)
++    {
++        if (material != null)
++        {
++            material.SetFloat("_fullscreenMono", enabled ? 1f : 0f);
++        }
++    }
+     
+     public void ResetCanvases()
+     {
+@@ -117,6 +159,17 @@ public class SetLERE : MonoBehaviour
+             matRE.SetFloat("_contentRatio", contentRatio);
+             matLE.SetFloat("_heightCompressionFactor", heightCompressionFactor);
+             matRE.SetFloat("_heightCompressionFactor", heightCompressionFactor);
++            ApplyFullscreenMono(matLE, fullscreenMono);
++            ApplyFullscreenMono(matRE, fullscreenMono);
++        }
++
++        // Texture is created after the source is selected. Keep both eye
++        // materials bound to the stable display copy rather than the decoder's
++        // native write target.
++        if (remoteCameraWindow != null && remoteCameraWindow.Texture != null)
++        {
++            matLE.SetTexture("_mainRT", remoteCameraWindow.Texture);
++            matRE.SetTexture("_mainRT", remoteCameraWindow.Texture);
+         }
+ 
+         if (Input.GetKeyDown(KeyCode.Q))
+diff --git a/Assets/Scripts/Li/toggle-objects-script.cs b/Assets/Scripts/Li/toggle-objects-script.cs
+index 40ade8a..c49cf3c 100644
+--- a/Assets/Scripts/Li/toggle-objects-script.cs
++++ b/Assets/Scripts/Li/toggle-objects-script.cs
+@@ -1,5 +1,7 @@
+ using UnityEngine;
+ using UnityEngine.XR;
++using System.Net.Sockets;
++using System.Text;
+ 
+ public class ToggleCameraClippingPlane : MonoBehaviour
+ {
+@@ -15,39 +17,38 @@ public class ToggleCameraClippingPlane : MonoBehaviour
+     
+     private bool wasButtonPressed = false;
+     private bool useValueA = true; // Start with the first value
++    [Header("PC view switch")]
++    [SerializeField] private string toggleHost = "192.168.0.83";
++    [SerializeField] private int togglePort = 12346;
+     
+     void Update()
+     {
+         // Return if the remote camera window is not active
+         if (!remoteCameraWindow.activeSelf) return;
+-        
+         // Get the right controller directly using XRNode
+         var rightControllerDevice = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
+         
+-        // Check if B button (secondaryButton) is pressed
++        // Use the right thumbstick click for view switching. B is reserved for
++        // the teleoperation emergency stop and must never be consumed by UI.
+         bool buttonValue = false;
+-        if (rightControllerDevice.TryGetFeatureValue(CommonUsages.secondaryButton, out buttonValue) && buttonValue)
++        if (rightControllerDevice.TryGetFeatureValue(CommonUsages.primary2DAxisClick, out buttonValue) && buttonValue)
+         {
+             // Only toggle on button press (not while holding)
+             if (!wasButtonPressed)
+             {
+-                // Toggle between the two near clip values
+-                float newClipValue = useValueA ? nearClipValueB : nearClipValueA;
+-                useValueA = !useValueA;
+-                
+-                // Apply to first camera
+-                if (firstCamera != null)
++                try
+                 {
+-                    firstCamera.nearClipPlane = newClipValue;
++                    byte[] message = Encoding.ASCII.GetBytes("toggle");
++                    using (UdpClient client = new UdpClient())
++                    {
++                        client.Send(message, message.Length, toggleHost, togglePort);
++                    }
++                    Debug.Log($"Requested PC camera switch at {toggleHost}:{togglePort}");
+                 }
+-                
+-                // Apply to second camera
+-                if (secondCamera != null)
++                catch (System.Exception exception)
+                 {
+-                    secondCamera.nearClipPlane = newClipValue;
++                    Debug.LogError($"Camera switch request failed: {exception.Message}");
+                 }
+-                
+-                Debug.Log($"Camera near clip plane changed to: {newClipValue}");
+             }
+             
+             wasButtonPressed = true;
+diff --git a/Assets/Scripts/Main.cs b/Assets/Scripts/Main.cs
+index 23e4722..e16dbb3 100644
+--- a/Assets/Scripts/Main.cs
++++ b/Assets/Scripts/Main.cs
+@@ -12,7 +12,10 @@ public class Main : MonoBehaviour
+         CrashProbe.Breadcrumb("main.awake");
+         DebugManager.instance.enableRuntimeUI = false;
+         Application.logMessageReceived += OnLogMessageReceived;
+-        XRSettings.eyeTextureResolutionScale = 1.5f;
++        // Full-scene remote video fills both eye buffers. A 1.5 scale renders
++        // 2.25x as many pixels and drove the headset down to 26-48 FPS, briefly
++        // exposing the passthrough layer on missed frames.
++        XRSettings.eyeTextureResolutionScale = 1.0f;
+         PXR_Manager.EnableVideoSeeThrough = true;
+         //Closing the security fence is only effective on B-end devices.
+         PXR_Enterprise.SwitchSystemFunction(SystemFunctionSwitchEnum.SFS_SECURITY_ZONE_PERMANENTLY, SwitchEnum.S_OFF);
+diff --git a/Assets/StreamingAssets/video_source.yml b/Assets/StreamingAssets/video_source.yml
+index 4fd94d3..f13853c 100644
+--- a/Assets/StreamingAssets/video_source.yml
++++ b/Assets/StreamingAssets/video_source.yml
+@@ -81,6 +81,38 @@
+       description: "Raw PCM audio stream port from the operator bridge"
+       value: 13580
+ 
++- name: "LOCAL_INNOMAKER"
++  camera: "ZED"
++  description: "PiPER wrist InnoMaker mono stream duplicated for both eyes"
++  properties:
++    - name: "visibleRatio"
++      type: "float"
++      value: 1.0
++    - name: "contentRatio"
++      type: "float"
++      value: 1.0
++    - name: "heightCompressionFactor"
++      type: "float"
++      value: 1.777778
++    - name: "RawImageRectSize"
++      type: "string"
++      value: "600x168.75"
++    - name: "CamWidth"
++      type: "int"
++      value: 1920
++    - name: "CamHeight"
++      type: "int"
++      value: 540
++    - name: "CamFPS"
++      type: "int"
++      value: 30
++    - name: "CamBitrate"
++      type: "int"
++      value: 4000000
++    - name: "AudioStreamPort"
++      type: "int"
++      value: 0
++
+ - name: "PANORAMA_MONO_1280x640"
+   camera: "PANORAMA"
+   description: "Equirectangular mono panorama (operator metadata must match)"
+diff --git a/ProjectSettings/ProjectSettings.asset b/ProjectSettings/ProjectSettings.asset
+index b40c52e..04c9c23 100644
+--- a/ProjectSettings/ProjectSettings.asset
++++ b/ProjectSettings/ProjectSettings.asset
+@@ -13,7 +13,7 @@ PlayerSettings:
+   useOnDemandResources: 0
+   accelerometerFrequency: 60
+   companyName: xrobotoolkit
+-  productName: XRoboToolkit
++  productName: XRoboToolkit Local View
+   defaultCursor: {fileID: 0}
+   cursorHotspot: {x: 0, y: 0}
+   m_SplashScreenBackgroundColor: {r: 0.12156863, g: 0.12156863, b: 0.1254902, a: 1}
+@@ -136,12 +136,9 @@ PlayerSettings:
+   vulkanEnableLateAcquireNextImage: 0
+   vulkanEnableCommandBufferRecycling: 1
+   loadStoreDebugModeEnabled: 0
+-  bundleVersion: 1.1.1
++  bundleVersion: 1.1.1-local.7
+   preloadedAssets:
+   - {fileID: 11400000, guid: f2ef844c0e47a5d4297d66125bf1d191, type: 2}
+-  - {fileID: -8221979108565540337, guid: da34a6e7d51410049b366296e6664eda, type: 2}
+-  - {fileID: 11400000, guid: baaededcd5eca33479b1d58ea0d96039, type: 2}
+-  - {fileID: -4845704345076574626, guid: 62beb5920dbc8f148a62ea2d6a9e63e1, type: 2}
+   metroInputSource: 0
+   wsaTransparentSwapchain: 0
+   m_HolographicPauseOnTrackingLoss: 1
+@@ -162,14 +159,14 @@ PlayerSettings:
+   androidSupportedAspectRatio: 1
+   androidMaxAspectRatio: 2.1
+   applicationIdentifier:
+-    Android: com.xrobotoolkit.client
++    Android: com.swaaniida.xrobotoolkit.localview
+   buildNumber:
+     Standalone: 0
+     VisionOS: 0
+     iPhone: 0
+     tvOS: 0
+   overrideDefaultApplicationIdentifier: 1
+-  AndroidBundleVersionCode: 1
++  AndroidBundleVersionCode: 10007
+   AndroidMinSdkVersion: 30
+   AndroidTargetSdkVersion: 31
+   AndroidPreferredInstallLocation: 1
+@@ -272,7 +269,7 @@ PlayerSettings:
+   AndroidEnableTango: 0
+   androidEnableBanner: 1
+   androidUseLowAccuracyLocation: 0
+-  androidUseCustomKeystore: 1
++  androidUseCustomKeystore: 0
+   m_AndroidBanners:
+   - width: 320
+     height: 180
